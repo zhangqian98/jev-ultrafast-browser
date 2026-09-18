@@ -31,6 +31,17 @@ class Browser:
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
+        # Let the app hydrate: stop once the actionable-element count is stable.
+        count_expr = ("document.querySelectorAll('a[href],button,input,textarea,select,"
+                      "summary,[contenteditable=\"true\"]').length")
+        prev = -1
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            n = self.evaluate(count_expr)
+            if n == prev:
+                break
+            prev = n
+            time.sleep(0.25)
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
