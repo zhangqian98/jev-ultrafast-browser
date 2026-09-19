@@ -128,7 +128,6 @@ def _decision(d):
     }
 
 
-@mcp.tool()
 def _origin_gate(agent):
     """When the session pins allowed origins, leaving them is a security event,
     not an action the agent may take. Returns a confirm response or None."""
