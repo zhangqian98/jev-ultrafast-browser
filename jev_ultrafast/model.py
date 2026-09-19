@@ -51,7 +51,8 @@ def validate_choice(answer, ids):
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
-    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "file": "UPLOAD_FILE",
+                  "select": "SELECT"}
     for action in actions:
         kind = action["kind"]
         if kind == "key":
@@ -81,6 +82,9 @@ def action_space(actions):
             target = f"{index}:{len(element['options']) + 1}"
             element["options"].append({"index": target, "label": action["label"], "value": action["value"]})
         group[target] = action
+    for element in elements:
+        if "CLICK" in element["operations"]:
+            element["operations"] += ["RIGHT_CLICK", "DOUBLE_CLICK", "HOVER", "DRAG"]
     return elements, targets, controls
 
 
@@ -88,13 +92,21 @@ def choose(state, goal, history):
     elements, targets, controls = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
+        "RIGHT_CLICK": "Right-click an element to open its context menu.",
+        "DOUBLE_CLICK": "Double-click an element to open or pin it, or to select a word.",
+        "HOVER": "Hover over an element to reveal tooltips or hover-only controls.",
+        "DRAG": "Drag one element onto another to reorder, dock, resize, or split a view.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
+        "UPLOAD_FILE": "Choose a local file for a file input. A helper supplies the absolute path.",
         "SELECT": "Select an observed dropdown value.",
-        "PRESS_KEY": "Press one key on the focused control: Enter confirms a focused input or "
+        "PRESS_KEY": "Press one key or offered key combination: Enter confirms a focused input or "
         "highlighted item, Escape dismisses a menu or dialog, arrows move within an open list "
-        "or menu, Tab moves focus.",
+        "or menu, Tab moves focus, and Ctrl+... chords trigger app shortcuts such as Quick Open.",
     }
     operations = {key: labels[key] for key in targets}
+    if "CLICK" in targets:
+        operations.update({key: labels[key]
+                           for key in ("RIGHT_CLICK", "DOUBLE_CLICK", "HOVER", "DRAG")})
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
     questions = {
@@ -117,6 +129,15 @@ def choose(state, goal, history):
             "criteria": criteria,
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    if "CLICK" in targets:
+        for head, role in (("drag_source", "the element to drag"),
+                           ("drag_target", "the element to drop onto")):
+            questions[head] = {
+                "type": "choice",
+                "criteria": questions["click_target"]["criteria"],
+                "instructions": {"goal": goal, "operation": "DRAG", "role": role,
+                                 "rules": [NEXT_ACTION, TARGET]},
+            }
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -135,17 +156,34 @@ def choose(state, goal, history):
     target = None
     target_answer = None
     probabilities = {}
-    if operation in targets:
-        # Unused target heads cannot cause an action. Validate the head selected by the operation.
-        target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
+    # RIGHT_CLICK, DOUBLE_CLICK, HOVER, and DRAG share CLICK's elements and target head(s);
+    # only the pointer sequence differs at execution.
+    drop = None
+    if operation == "DRAG":
+        target_answer = validate_choice(result["answers"].get("drag_source", {}), targets["CLICK"])
+        drop_answer = validate_choice(result["answers"].get("drag_target", {}), targets["CLICK"])
         target = target_answer["choice"]
-        choice = targets[operation][target]["id"]
-        probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
+        if target == drop_answer["choice"]:
+            raise ValueError("Invalid TypeSafe response: drag source equals its drop target")
+        choice = targets["CLICK"][target]["id"]
+        drop = targets["CLICK"][drop_answer["choice"]]["id"]
+        probabilities = {a["id"]: target_answer["probabilities"][index]
+                         for index, a in targets["CLICK"].items()}
     else:
-        choice = controls[operation]["id"] if operation in controls else operation
-        probabilities[choice] = operation_answer["probabilities"][operation]
+        target_op = "CLICK" if operation in {"RIGHT_CLICK", "DOUBLE_CLICK", "HOVER"} else operation
+        if target_op in targets:
+            # Unused target heads cannot cause an action. Validate the head selected by the operation.
+            target_answer = validate_choice(
+                result["answers"].get(target_op.lower() + "_target", {}), targets[target_op])
+            target = target_answer["choice"]
+            choice = targets[target_op][target]["id"]
+            probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[target_op].items()}
+        else:
+            choice = controls[operation]["id"] if operation in controls else operation
+            probabilities[choice] = operation_answer["probabilities"][operation]
     return {
         "choice": choice,
+        "drop": drop,
         "operation": operation,
         "target": target,
         "confidence": operation_answer["confidence"],

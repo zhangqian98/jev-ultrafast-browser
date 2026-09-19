@@ -87,12 +87,14 @@
         actions.push({...base,kind:'select',value:o.value,
           current_value:[...e.selectedOptions].map(o=>o.label).join(', '),label:base.label+' → '+o.label});
     } else {
-      const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
+      const file=e.type==='file';
+      const editable=!file && !e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
-      const value='value' in e ? String(e.value) :
+      const value=file ? (e.files?.length ? [...e.files].map(f=>f.name).join(', ') : '') :
+        'value' in e ? String(e.value) :
         e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '';
-      actions.push({...base,kind:editable?'fill':'click',value});
+      actions.push({...base,kind:file?'file':editable?'fill':'click',value});
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
@@ -106,7 +108,8 @@
       words.push(value); length+=value.length;
     }
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight,
+    width=document.documentElement.scrollWidth;
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
@@ -118,9 +121,18 @@
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  if (scrollX+innerWidth<width-2)
+    actions.push({id:'scroll_right',kind:'scroll',label:'Scroll right',delta:0,dx:560});
+  if (scrollX>0)
+    actions.push({id:'scroll_left',kind:'scroll',label:'Scroll left',delta:0,dx:-560});
   if (document.activeElement && !['BODY','HTML'].includes(document.activeElement.tagName))
     for (const key of ['Enter','Escape','Tab','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'])
       actions.push({id:'key_'+key.toLowerCase(),kind:'key',key,label:'Press '+key});
+  if (location.href.includes('workbench.html'))
+    for (const key of ['Ctrl+P','Ctrl+Shift+P','Ctrl+`','Ctrl+N','Ctrl+S','Ctrl+W','Ctrl+F',
+                       'Ctrl+Shift+E','Ctrl+Shift+F','Ctrl+Shift+X','Ctrl+B','Ctrl+Z','Ctrl+Y'])
+      actions.push({id:'key_'+key.toLowerCase().replaceAll('+','_'),kind:'key',key,
+        label:'Press '+key});
   const containers=[];
   for (const e of document.body.querySelectorAll('*')) {
     if (e.scrollHeight<=e.clientHeight+2 || !visible(e)) continue;
@@ -141,6 +153,22 @@
     if (e.scrollTop>0)
       actions.push({id:'scroll_up_'+identity(e),kind:'scroll',node:identity(e),
         delta:-Math.round(e.clientHeight*0.7),label:'Scroll up in '+label});
+    if (e.scrollWidth>e.clientWidth+2 &&
+        ['auto','scroll'].includes(getComputedStyle(e).overflowX)) {
+      if (e.scrollLeft+e.clientWidth<e.scrollWidth-2)
+        actions.push({id:'scroll_right_'+identity(e),kind:'scroll',node:identity(e),
+          delta:0,dx:Math.round(e.clientWidth*0.7),label:'Scroll right in '+label});
+      if (e.scrollLeft>0)
+        actions.push({id:'scroll_left_'+identity(e),kind:'scroll',node:identity(e),
+          delta:0,dx:-Math.round(e.clientWidth*0.7),label:'Scroll left in '+label});
+    }
+  }
+  if (!location.href.includes('workbench.html')) {
+    if (history.length>1) {
+      actions.push({id:'back',kind:'back',label:'Go back in page history'});
+      actions.push({id:'forward',kind:'forward',label:'Go forward in page history'});
+    }
+    actions.push({id:'reload',kind:'reload',label:'Reload the page'});
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,

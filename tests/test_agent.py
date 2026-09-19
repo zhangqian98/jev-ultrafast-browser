@@ -67,7 +67,10 @@ def test_invalid_choice_is_rejected(mutation):
 def test_one_index_per_node_with_operation_specific_targets():
     elements, targets, controls = model.action_space(page()["actions"])
     assert len(elements) == 2
-    assert elements[0]["operations"] == ["TYPE_TEXT", "CLICK"]
+    assert elements[0]["operations"] == ["TYPE_TEXT", "CLICK", "RIGHT_CLICK",
+                                       "DOUBLE_CLICK", "HOVER", "DRAG"]
+    assert elements[1]["operations"] == ["CLICK", "RIGHT_CLICK",
+                                         "DOUBLE_CLICK", "HOVER", "DRAG"]
     assert targets["TYPE_TEXT"]["1"]["id"] == "e1"
     assert targets["CLICK"]["1"]["id"] == "e2"
     assert targets["CLICK"]["2"]["id"] == "e3"
@@ -93,7 +96,62 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
-    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target",
+                                         "drag_source", "drag_target"}
+
+
+@pytest.mark.parametrize("operation", ["RIGHT_CLICK", "DOUBLE_CLICK", "HOVER"])
+def test_pointer_operations_reuse_the_click_target_head(monkeypatch, operation):
+    def post(_url, _key, body):
+        assert operation in body["questions"]["operation"]["criteria"]
+        assert operation.lower() + "_target" not in body["questions"]
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], operation),
+                "click_target": choice(["1", "2"], "2"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Operate on Go", [])
+    assert d["operation"] == operation and d["choice"] == "e3" and d["target"] == "2"
+
+
+def test_file_input_gets_an_upload_operation():
+    p = page()
+    p["actions"].insert(2, {"id": "e5", "kind": "file",
+                            "label": "Upload file to Avatar", "node": 30})
+    elements, targets, _controls = model.action_space(p["actions"])
+    assert targets["UPLOAD_FILE"]["2"]["id"] == "e5"
+    assert elements[1]["operations"] == ["UPLOAD_FILE"]
+
+
+def test_drag_uses_two_target_heads_and_rejects_self_drop(monkeypatch):
+    seen = {}
+
+    def post(_url, _key, body):
+        assert "DRAG" in body["questions"]["operation"]["criteria"]
+        assert body["questions"]["drag_source"]["criteria"] == \
+            body["questions"]["drag_target"]["criteria"]
+        seen["self_drop"] = seen.get("self_drop", False)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "DRAG"),
+                "drag_source": choice(["1", "2"], "1"),
+                "drag_target": choice(["1", "2"], "1" if seen["self_drop"] else "2"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Drag the search box onto Go", [])
+    assert d["operation"] == "DRAG" and d["choice"] == "e2" and d["drop"] == "e3"
+    seen["self_drop"] = True
+    with pytest.raises(ValueError, match="Invalid TypeSafe"):
+        model.choose(page(), "Drag the search box onto itself", [])
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -177,6 +235,175 @@ def runner():
         "text_calls": [],
     }
     return a
+
+
+def test_right_click_act_passes_the_right_button(runner):
+    runner.state["decision"] = {**decision("e3"), "operation": "RIGHT_CLICK", "target": "2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    action = runner.state["browser"].act.call_args.args[0]
+    assert action["id"] == "e3" and action["button"] == "right"
+    assert runner.state["history"][-1]["operation"] == "RIGHT_CLICK"
+
+
+def test_pointer_operations_pass_execution_modifiers(runner):
+    for operation, expect in (("DOUBLE_CLICK", {"clicks": 2}),
+                              ("HOVER", {"hover": True})):
+        runner.state["decision"] = {**decision("e3"), "operation": operation, "target": "2"}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+        action = runner.state["browser"].act.call_args.args[0]
+        assert all(action[k] == v for k, v in expect.items())
+
+
+def test_drag_act_builds_a_drag_action(runner):
+    runner.state["decision"] = {**decision("e3"), "operation": "DRAG", "target": "2",
+                                "drop": "e2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    action = runner.state["browser"].act.call_args.args[0]
+    assert action["kind"] == "drag" and action["node"] == 20 and action["target_node"] == 10
+
+
+def test_browser_operation_dispatches_the_right_button():
+    sent = []
+
+    def send(method, session_id=None, **params):
+        sent.append((method, params))
+        if method == "Runtime.evaluate":
+            return {"result": {"value": {"x": 5, "y": 6}}}
+        return {}
+
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "e1", "kind": "click", "node": 1,
+                                  "button": "right", "label": "x"},
+                       "text": None, "cdp": send})
+    clicks = [p for m, p in sent if m == "Input.dispatchMouseEvent"]
+    assert [c["type"] for c in clicks] == ["mousePressed", "mouseReleased"]
+    assert all(c["button"] == "right" for c in clicks)
+
+
+def test_browser_operation_hover_and_drag_and_nav():
+    sent = []
+
+    def send(method, session_id=None, **params):
+        sent.append((method, params))
+        if method == "Runtime.evaluate":
+            expr = params["expression"]
+            if "sx" in expr:  # drag geometry probe
+                return {"result": {"value": {"sx": 1, "sy": 1, "dx": 9, "dy": 9}}}
+            return {"result": {"value": {"x": 5, "y": 6}}}
+        return {}
+
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "e1", "kind": "click", "node": 1,
+                                  "hover": True, "label": "x"},
+                       "text": None, "cdp": send})
+    hover = [p["type"] for m, p in sent if m == "Input.dispatchMouseEvent"]
+    assert hover == ["mouseMoved"]
+
+    sent.clear()
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "e1", "kind": "drag", "node": 1,
+                                  "target_node": 2, "label": "x"},
+                       "text": None, "cdp": send})
+    drag = [p["type"] for m, p in sent if m == "Input.dispatchMouseEvent"]
+    assert drag == ["mouseMoved", "mousePressed", "mouseMoved",
+                    "mouseMoved", "mouseMoved", "mouseReleased"]
+
+    sent.clear()
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "back", "kind": "back", "label": "Back"},
+                       "text": None, "cdp": send})
+    assert sent[-1][1]["expression"] == "history.back()"
+
+
+def test_upload_file_requires_an_existing_local_path(runner, monkeypatch, tmp_path):
+    p = runner.state["page"]
+    p["actions"].append({"id": "e5", "kind": "file",
+                         "label": "Upload file to Avatar", "node": 30})
+    p["fingerprint"] = fingerprint(p)
+    f = tmp_path / "avatar.png"
+    f.write_bytes(b"png")
+    helper = Mock(side_effect=lambda ctxs: ([str(f) for _c in ctxs],
+                                            {"model": "test", "latency_ms": 1}))
+    monkeypatch.setattr(loop, "field_texts", helper)
+    runner.state["decision"] = {**decision("e5"), "operation": "UPLOAD_FILE"}
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    action, _page = runner.state["browser"].act.call_args.args[:2]
+    assert action["kind"] == "file"
+    assert runner.state["browser"].act.call_args.kwargs["text"] == str(f)
+
+    helper.side_effect = lambda ctxs: (["/no/such/file.png" for _c in ctxs],
+                                     {"model": "test", "latency_ms": 1})
+    runner.state["decision"] = {**decision("e5"), "operation": "UPLOAD_FILE"}
+    with pytest.raises(ValueError, match="does not exist"):
+        runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_count == 1  # invalid path never reached the browser
+
+
+def test_file_upload_sets_files_on_the_observed_input():
+    sent = []
+
+    def send(method, session_id=None, **params):
+        sent.append((method, params))
+        if method == "Runtime.evaluate":
+            return {"result": {"objectId": "o1"}}
+        return {}
+
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "e1", "kind": "file", "node": 7, "label": "x"},
+                       "text": "C:/tmp/a.png", "cdp": send})
+    uploads = [p for m, p in sent if m == "DOM.setFileInputFiles"]
+    assert uploads == [{"files": ["C:/tmp/a.png"], "objectId": "o1"}]
+
+
+def test_horizontal_scroll_dispatches_delta_x():
+    sent = []
+
+    def send(method, session_id=None, **params):
+        sent.append((method, params))
+        return {}
+
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "scroll_right", "kind": "scroll",
+                                  "delta": 0, "dx": 560, "label": "Scroll right"},
+                       "text": None, "cdp": send})
+    wheels = [p for m, p in sent if m == "Input.dispatchMouseEvent"]
+    assert wheels == [{"type": "mouseWheel", "x": 550, "y": 650, "deltaX": 560, "deltaY": 0}]
+
+
+def test_new_page_target_is_followed():
+    from jev_ultrafast.browser import Browser
+    b = Browser.__new__(Browser)
+    b.follow, b.target, b.session, b.owned = True, "t0", "s0", True
+    b._known_targets = {"t0"}
+    b._owned_targets = {"t0"}
+    calls = []
+
+    def cdp(method, **params):
+        calls.append((method, params))
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "page", "targetId": "t0"},
+                                    {"type": "page", "targetId": "t1", "openerId": "t0"}]}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s1"}
+        return {}
+
+    b.cdp = cdp
+    b._maybe_retarget()
+    assert (b.target, b.session) == ("t1", "s1")
+    assert "t1" in b._owned_targets
+    assert any(m == "Target.detachFromTarget" for m, _p in calls)
+
+
+def test_press_key_sends_modifier_combinations():
+    from jev_ultrafast.browser import press_key
+    sent = []
+    press_key(lambda m, **p: sent.append((m, p)), "Ctrl+Shift+P")
+    events = [p for m, p in sent if m == "Input.dispatchKeyEvent"]
+    assert [e["type"] for e in events] == ["rawKeyDown", "keyUp"]
+    assert all(e["modifiers"] == 10 and e["key"] == "P" and e["code"] == "KeyP"
+               for e in events)
+    with pytest.raises(ValueError, match="Unsupported key"):
+        press_key(lambda m, **p: None, "Ctrl+Alt+Delete")
 
 
 def test_stale_decision_is_consumed_before_any_mutation(runner):

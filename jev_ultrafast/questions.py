@@ -14,7 +14,13 @@ DONE requires visible evidence that ALL requirements are satisfied. If asked to 
 a matching link is not enough. BLOCKED means no supported operation can make progress.
 PRESS_KEY only for keyboard-driven widgets (quick pickers, menus, command palettes): prefer CLICK
 when the target is a visible element. Scroll inside a named container when the needed item is in
-that list, not in the page. An open menu, dropdown, or dialog must be used (CLICK an item) or
+that list, not in the page. RIGHT_CLICK opens an element's context menu; use it for per-item
+commands (rename, delete, copy) that no visible button offers. DOUBLE_CLICK opens or pins
+items and selects words. HOVER reveals tooltips and hover-only controls. UPLOAD_FILE supplies
+an absolute local file path to a file input. DRAG reorders,
+docks, resizes, or splits items; it needs a source and a target element. BACK, FORWARD, and
+RELOAD navigate or refresh the page itself. An open menu, dropdown, or
+dialog must be used (CLICK an item) or
 dismissed with PRESS_KEY Escape before anything else; it is never evidence that the goal is complete."""
 
 TARGET = """Choose the best observed target if the next operation is the one specified in this question.

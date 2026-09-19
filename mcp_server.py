@@ -23,7 +23,7 @@ from mcp.server.mcpserver import MCPServer
 
 import jev_ultrafast.agent as agent_mod
 from jev_ultrafast.agent import Agent
-from jev_ultrafast.browser import KEYS, StalePage, press_key
+from jev_ultrafast.browser import COMBOS, KEYS, StalePage, press_key
 from jev_ultrafast.model import CLIENT, field_context
 
 _BROWSERS = (
@@ -231,7 +231,7 @@ def browser_step(session_id: str) -> dict:
             agent.command("act", {"fingerprint": st["page"]["fingerprint"]})
             return {"status": st["status"], "decision": _decision(d)}
         action = next(a for a in st["page"]["actions"] if a["id"] == selected)
-        if action["kind"] == "fill":
+        if action["kind"] in ("fill", "file"):
             ctx = field_context(st["goal"], action, st["page"], st["history"])
             s["pending"] = ctx
             s["pending_node"] = action["node"]
@@ -281,7 +281,7 @@ def browser_supply_text(session_id: str, text: str) -> dict:
         # Same DOM node + byte-identical field context → the model's choice still holds;
         # retry the fill without paying another decision call.
         retry = next((a for a in st["page"]["actions"]
-                      if a["kind"] == "fill" and a["node"] == s.get("pending_node")
+                      if a["kind"] in ("fill", "file") and a["node"] == s.get("pending_node")
                       and field_context(st["goal"], a, st["page"], st["history"]) == ctx), None)
         if retry is None:
             s["pending"] = s["pending_node"] = None
@@ -312,7 +312,8 @@ def browser_press_key(session_id: str, key: str) -> dict:
     s = _sessions.get(session_id)
     if not s:
         return {"status": "error", "error": "unknown session_id"}
-    name = _KEY_ALIASES.get(key.lower()) or next((k for k in KEYS if k.lower() == key.lower()), None)
+    name = _KEY_ALIASES.get(key.lower()) or next(
+        (k for k in (*KEYS, *COMBOS) if k.lower() == key.lower()), None)
     if not name:
         return {"status": "error", "error": f"unsupported key '{key}'"}
     press_key(s["agent"].state["browser"].call, name)
@@ -335,6 +336,36 @@ def browser_click_xy(session_id: str, x: float, y: float) -> dict:
              button="left", clickCount=1)
     time.sleep(0.15)
     return {"status": "ok", "x": x, "y": y}
+
+
+@mcp.tool()
+def browser_tabs(session_id: str) -> dict:
+    """List open page tabs in the session's browser, marking the observed one."""
+    s = _sessions.get(session_id)
+    if not s:
+        return {"status": "error", "error": "unknown session_id"}
+    b = s["agent"].state["browser"]
+    return {"tabs": [{"index": i, "url": t["url"], "title": t["title"],
+                      "current": t["targetId"] == b.target}
+                     for i, t in enumerate(b._pages())]}
+
+
+@mcp.tool()
+def browser_switch_tab(session_id: str, index: int) -> dict:
+    """Attach the agent to a different tab from browser_tabs and observe it."""
+    s = _sessions.get(session_id)
+    if not s:
+        return {"status": "error", "error": "unknown session_id"}
+    b = s["agent"].state["browser"]
+    pages = b._pages()
+    if not 0 <= index < len(pages):
+        return {"status": "error", "error": f"no tab at index {index}"}
+    if pages[index]["targetId"] != b.target:
+        b.switch_to(pages[index]["targetId"])
+    st = s["agent"].state
+    st["decision"] = None
+    st["page"] = b.observe(screenshot=False)
+    return {"status": st["status"], **_view(s["agent"])}
 
 
 @mcp.tool()

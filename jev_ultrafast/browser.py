@@ -18,6 +18,23 @@ MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})
 KEYS = {"Enter": 13, "Escape": 27, "Tab": 9, "Backspace": 8,
         "ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39}
 
+# Code-owned key combinations (modifiers bit: Alt=1, Ctrl=2, Shift=8). The model can only
+# pick from this set; it cannot invent chords. Offered mainly on desktop-app surfaces.
+def _combo(base, code, vk, shift=False):
+    return (10 if shift else 2, base.upper() if shift else base, code, vk)
+
+
+COMBOS = {
+    "Ctrl+P": _combo("p", "KeyP", 80), "Ctrl+Shift+P": _combo("p", "KeyP", 80, True),
+    "Ctrl+`": _combo("`", "Backquote", 192), "Ctrl+N": _combo("n", "KeyN", 78),
+    "Ctrl+S": _combo("s", "KeyS", 83), "Ctrl+W": _combo("w", "KeyW", 87),
+    "Ctrl+F": _combo("f", "KeyF", 70), "Ctrl+B": _combo("b", "KeyB", 66),
+    "Ctrl+Z": _combo("z", "KeyZ", 90), "Ctrl+Y": _combo("y", "KeyY", 89),
+    "Ctrl+Shift+E": _combo("e", "KeyE", 69, True),
+    "Ctrl+Shift+F": _combo("f", "KeyF", 70, True),
+    "Ctrl+Shift+X": _combo("x", "KeyX", 88, True),
+}
+
 
 class DirectCDP:
     """Raw CDP over one browser-level websocket; same call shape as helpers.cdp."""
@@ -28,12 +45,14 @@ class DirectCDP:
         self.ws = websockets.sync.client.connect(
             info["webSocketDebuggerUrl"], max_size=None, open_timeout=timeout)
         self.timeout, self.next_id = timeout, 0
+        self.events = []
 
     @classmethod
     def from_ws_url(cls, url, timeout=30):
         cdp_ = cls.__new__(cls)
         cdp_.ws = websockets.sync.client.connect(url, max_size=None, open_timeout=timeout)
         cdp_.timeout, cdp_.next_id = timeout, 0
+        cdp_.events = []
         return cdp_
 
     def __call__(self, method, session_id=None, _response_timeout=None, **params):
@@ -45,7 +64,19 @@ class DirectCDP:
         deadline = time.monotonic() + (_response_timeout or self.timeout)
         while True:
             reply = json.loads(self.ws.recv(timeout=max(0.01, deadline - time.monotonic())))
+            if reply.get("method") == "Page.javascriptDialogOpening":
+                # A modal dialog blocks all evaluation; dismiss it in-band so calls unblock.
+                self.next_id += 1
+                dismiss = {"id": self.next_id, "method": "Page.handleJavaScriptDialog",
+                           "params": {"accept": False}}
+                if reply.get("sessionId"):
+                    dismiss["sessionId"] = reply["sessionId"]
+                self.events.append(reply)
+                self.ws.send(json.dumps(dismiss))
+                continue
             if reply.get("id") != self.next_id:
+                if "method" in reply:
+                    self.events.append(reply)
                 continue  # events and stale replies
             if "error" in reply:
                 raise RuntimeError(reply["error"].get("message", reply["error"]))
@@ -56,6 +87,12 @@ class DirectCDP:
 
 
 def press_key(call, key):
+    if key in COMBOS:
+        modifiers, value, code, vk = COMBOS[key]
+        for event in ("rawKeyDown", "keyUp"):
+            call("Input.dispatchKeyEvent", type=event, key=value, code=code,
+                 windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk, modifiers=modifiers)
+        return
     if key not in KEYS:
         raise ValueError(f"Unsupported key {key!r}")
     vk = KEYS[key]
@@ -83,6 +120,8 @@ class Browser:
             self.cdp = cdp
         self.target = None
         self.session = None
+        self._owned_targets = set()
+        self._known_targets = set()
         if attach is not None:
             self.owned = False
             targets = self.cdp("Target.getTargets").get("targetInfos", [])
@@ -98,12 +137,52 @@ class Browser:
         else:
             self.owned = True
             self.target = self.cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+            self._owned_targets = {self.target}
             self.session = self.cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
             self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
             # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
             self.call("Page.navigate", url=url, _response_timeout=30)
+        try:
+            self.call("Page.enable")  # required for dialog events
+        except RuntimeError:
+            pass
+        self.follow = self.owned  # only dedicated automation browsers get new tabs
+        self._known_targets = {t["targetId"] for t in self._pages()}
         self._settle()
+
+    def _pages(self):
+        try:
+            return [t for t in self.cdp("Target.getTargets").get("targetInfos", [])
+                    if t.get("type") == "page"]
+        except Exception:
+            return []
+
+    def switch_to(self, target_id):
+        session = self.cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+        try:
+            self.cdp("Target.detachFromTarget", sessionId=self.session)
+        except RuntimeError:
+            pass
+        self.target, self.session = target_id, session
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        try:
+            self.call("Page.enable")
+        except RuntimeError:
+            pass
+
+    def _maybe_retarget(self):
+        """Follow tabs the page opened (window.open, target=_blank, ctrl+click)."""
+        if not self.follow or not self.target:
+            return
+        pages = self._pages()
+        fresh = [t for t in pages if t["targetId"] not in self._known_targets]
+        self._known_targets = {t["targetId"] for t in pages}
+        if fresh:
+            opened = next((t for t in fresh if t.get("openerId") == self.target), fresh[-1])
+            if self.owned:
+                self._owned_targets.add(opened["targetId"])
+            self.switch_to(opened["targetId"])
 
     def _settle(self):
         deadline = time.monotonic() + 15
@@ -172,6 +251,7 @@ class Browser:
                 )
             except RuntimeError:
                 pass
+        self._maybe_retarget()
         for attempt in range(10):
             try:
                 return browser_operation(
@@ -213,7 +293,11 @@ class Browser:
         target, session = self.target, self.session
         self.target = self.session = None
         if self.owned:
-            self.cdp("Target.closeTarget", targetId=target)
+            for owned in self._owned_targets | {target}:
+                try:
+                    self.cdp("Target.closeTarget", targetId=owned)
+                except RuntimeError:
+                    pass
         else:
             try:
                 self.cdp("Target.detachFromTarget", sessionId=session)
@@ -251,7 +335,7 @@ def browser_operation(request):
             node = action.get("node")
             if node is None:
                 call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650,
-                     deltaX=0, deltaY=action["delta"])
+                     deltaX=action.get("dx", 0), deltaY=action["delta"])
             else:
                 if type(node) is not int:
                     raise ValueError("Invalid observed node")
@@ -266,9 +350,53 @@ def browser_operation(request):
                 if center is None:
                     raise StalePage("Scroll container changed. Observe again.")
                 call("Input.dispatchMouseEvent", type="mouseWheel", x=center["x"], y=center["y"],
-                     deltaX=0, deltaY=action["delta"])
+                     deltaX=action.get("dx", 0), deltaY=action["delta"])
+        elif kind == "file":
+            if type(action["node"]) is not int:
+                raise ValueError("Invalid observed node")
+            obj = call("Runtime.evaluate", expression="""(node => {
+              const e=window.__jevFast?.nodes.get(node);
+              return e?.isConnected && e.type==='file' ? e : null;
+            })(""" + json.dumps(action["node"]) + ")")
+            oid = obj.get("result", {}).get("objectId")
+            if not oid:
+                raise StalePage("File input changed. Observe again.")
+            call("DOM.setFileInputFiles", files=[request["text"]], objectId=oid)
         elif kind == "key":
             press_key(call, action["key"])
+        elif kind == "drag":
+            if type(action["node"]) is not int or type(action["target_node"]) is not int:
+                raise ValueError("Invalid observed node")
+            if "geom" in action and type(action["geom"]) is not int:
+                raise ValueError("Invalid observed node")
+            points = evaluate("""(action => {
+              const n=window.__jevFast?.nodes;
+              const s=n.get(action.node), sg=n.get(action.geom ?? action.node), d=n.get(action.target_node);
+              if (!s?.isConnected || !sg?.isConnected || !d?.isConnected ||
+                  !s.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
+                  !sg.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
+                  !d.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
+              const c=e=>{const r=e.getBoundingClientRect();
+                return {x:r.x+r.width/2,y:r.y+r.height/2,w:r.width,h:r.height}};
+              const a=c(sg), b=c(d);
+              if (!a.w||!a.h||!b.w||!b.h||a.x<0||a.y<0||a.x>=innerWidth||a.y>=innerHeight||
+                  b.x<0||b.y<0||b.x>=innerWidth||b.y>=innerHeight) return null;
+              return {sx:a.x, sy:a.y, dx:b.x, dy:b.y};
+            })(""" + json.dumps(action) + ")")
+            if points is None:
+                raise StalePage("Drag source or target changed. Observe again.")
+            call("Input.dispatchMouseEvent", type="mouseMoved", x=points["sx"], y=points["sy"])
+            call("Input.dispatchMouseEvent", type="mousePressed", x=points["sx"], y=points["sy"],
+                 button="left", clickCount=1)
+            for step in (1, 2, 3):
+                call("Input.dispatchMouseEvent", type="mouseMoved",
+                     x=points["sx"] + (points["dx"] - points["sx"]) * step / 3,
+                     y=points["sy"] + (points["dy"] - points["sy"]) * step / 3)
+            call("Input.dispatchMouseEvent", type="mouseReleased", x=points["dx"], y=points["dy"],
+                 button="left", clickCount=1)
+        elif kind in ("back", "forward", "reload"):
+            evaluate({"back": "history.back()", "forward": "history.forward()",
+                      "reload": "location.reload()"}[kind])
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -301,8 +429,13 @@ def browser_operation(request):
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                if action.get("hover"):
+                    call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+                else:
+                    for event in ("mousePressed", "mouseReleased"):
+                        call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                             button="right" if action.get("button") == "right" else "left",
+                             clickCount=action.get("clicks", 1))
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",

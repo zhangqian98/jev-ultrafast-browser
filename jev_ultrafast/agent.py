@@ -110,11 +110,21 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
+            if decision["operation"] == "RIGHT_CLICK":
+                action = {**action, "button": "right"}
+            elif decision["operation"] == "DOUBLE_CLICK":
+                action = {**action, "clicks": 2}
+            elif decision["operation"] == "HOVER":
+                action = {**action, "hover": True}
+            elif decision["operation"] == "DRAG":
+                drop = next(a for a in page["actions"] if a["id"] == decision["drop"])
+                action = {**action, "kind": "drag", "target_node": drop["node"],
+                          "label": f"Drag {action['label']} onto {drop['label']}"}
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
             text, helper = None, None
-            if action["kind"] == "fill":
+            if action["kind"] in ("fill", "file"):
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
@@ -128,7 +138,8 @@ class Agent:
                     # Speculative batch: values for every other empty fill field come
                     # back in the same helper call, cached by context for later steps.
                     others = [a for a in page["actions"]
-                              if a["kind"] == "fill" and a["id"] != action["id"] and not a.get("value")]
+                              if a["kind"] in ("fill", "file") and a["id"] != action["id"]
+                              and not a.get("value")]
                     contexts = [context] + [
                         field_context(state["goal"], a, page, state["history"]) for a in others]
                     values, helper = field_texts(contexts)
@@ -140,6 +151,8 @@ class Agent:
                         self.text_cache.pop(next(iter(self.text_cache)))
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+            if action["kind"] == "file" and not (text and Path(text.strip()).is_file()):
+                raise ValueError(f"Upload path does not exist: {text!r}")
             # Browser.act checks freshness immediately before input, including after text generation.
             try:
                 state["browser"].act(action, page, text=text)
