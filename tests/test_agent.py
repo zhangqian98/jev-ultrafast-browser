@@ -97,7 +97,7 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
     assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target",
-                                         "drag_source", "drag_target"}
+                                         "drag_source", "drag_target", "done", "risk"}
 
 
 @pytest.mark.parametrize("operation", ["RIGHT_CLICK", "DOUBLE_CLICK", "HOVER"])
@@ -360,14 +360,21 @@ def test_horizontal_scroll_dispatches_delta_x():
 
     def send(method, session_id=None, **params):
         sent.append((method, params))
+        if method == "Runtime.evaluate":
+            v = send.pos
+            send.pos = "0,560"
+            return {"result": {"value": v}}
         return {}
 
+    send.pos = "0,0"
     browser_operation({"operation": "act", "session": "s",
                        "action": {"id": "scroll_right", "kind": "scroll",
                                   "delta": 0, "dx": 560, "label": "Scroll right"},
                        "text": None, "cdp": send})
     wheels = [p for m, p in sent if m == "Input.dispatchMouseEvent"]
-    assert wheels == [{"type": "mouseWheel", "x": 550, "y": 650, "deltaX": 560, "deltaY": 0}]
+    assert [w["type"] for w in wheels] == ["mouseMoved", "mouseWheel"]
+    assert wheels[-1] == {"type": "mouseWheel", "x": 550, "y": 650,
+                          "deltaX": 560, "deltaY": 0}
 
 
 def test_new_page_target_is_followed():
@@ -643,16 +650,44 @@ def test_key_action_rejects_unknown_key():
 def test_scroll_in_container_resolves_center():
     def send(method, session_id=None, **params):
         if method == "Runtime.evaluate":
+            expr = params.get("expression", "")
+            if "scrollTop" in expr:
+                v = send.pos
+                send.pos = "200,0"
+                return {"result": {"value": v}}
             return {"result": {"value": {"x": 300, "y": 400}}}
         return {}
 
+    send.pos = "0,0"
     cdp = Mock(side_effect=send)
     result = browser_operation({"operation": "act", "session": "test", "cdp": cdp,
                                 "action": {"id": "scroll_down_5", "kind": "scroll",
                                            "node": 5, "delta": 200}})
     assert result == {"executed": "scroll_down_5"}
-    wheel = next(c for c in cdp.call_args_list if c.args[0] == "Input.dispatchMouseEvent")
+    wheels = [c for c in cdp.call_args_list
+              if c.args[0] == "Input.dispatchMouseEvent" and c.kwargs["type"] == "mouseWheel"]
+    assert len(wheels) == 1
+    wheel = wheels[0]
     assert wheel.kwargs["x"] == 300 and wheel.kwargs["y"] == 400 and wheel.kwargs["deltaY"] == 200
+
+
+def test_dropped_wheel_is_dispatched_again():
+    sent = []
+
+    def send(method, session_id=None, **params):
+        sent.append(method)
+        if method == "Runtime.evaluate":
+            expr = params.get("expression", "")
+            if "scrollY" in expr or "scrollX" in expr:
+                return {"result": {"value": "0,0"}}  # wheel never lands
+            return {"result": {"value": None}}
+        return {}
+
+    browser_operation({"operation": "act", "session": "s",
+                       "action": {"id": "scroll_down", "kind": "scroll",
+                                  "delta": 560, "label": "Scroll down"},
+                       "text": None, "cdp": send})
+    assert sent.count("Input.dispatchMouseEvent") == 4  # two hover+wheel attempts
 
 
 def test_scroll_in_gone_container_is_stale():
@@ -765,3 +800,183 @@ def test_direct_cdp_roundtrip_events_and_errors():
         conn.close()
     finally:
         server.shutdown()
+
+
+def test_choose_asks_done_and_risk_nouls(monkeypatch):
+    def post(_url, _key, body):
+        assert body["questions"]["done"]["type"] == "noul"
+        assert body["questions"]["risk"]["type"] == "noul"
+        return {
+            "model": "test",
+            "usage": {"input_tokens": 1000},
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(["1", "2"], "2"),
+                "done": {"noul": 0.05},
+                "risk": {"noul": 0.01},
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert d["done_p"] == 0.05 and d["risk_p"] == 0.01
+    assert d["cost_usd"] == pytest.approx(0.042 / 1e6 * 1000)
+
+
+def test_policy_verdicts():
+    from jev_ultrafast.policy import evaluate_policy, match_sensitive
+    assert evaluate_policy(operation="CLICK", done=0.95)["verdict"] == "done"
+    assert evaluate_policy(operation="CLICK", label="Delete account",
+                           confidence=0.9)["verdict"] == "confirm"
+    assert evaluate_policy(operation="CLICK", risk=0.8, confidence=0.9)["verdict"] == "confirm"
+    assert evaluate_policy(operation="CLICK", confidence=0.2)["verdict"] == "stop"
+    assert evaluate_policy(operation="CLICK", confidence=0.4)["verdict"] == "escalate"
+    assert evaluate_policy(operation="CLICK", confidence=0.9)["verdict"] == "proceed"
+    # Read-only exploration is exempt from the confidence floor (LOW_RISK relaxation).
+    assert evaluate_policy(operation="WAIT", confidence=0.2)["verdict"] == "proceed"
+    assert evaluate_policy(operation="SCROLL_DOWN", confidence=0.1)["verdict"] == "proceed"
+    d = evaluate_policy(operation="DONE", done=0.3)
+    assert d["verdict"] == "escalate" and "done probability" in d["reasons"][0]
+    assert match_sensitive("Permanently delete repository") == "delete"
+    assert match_sensitive("立即支付") == "payment"
+    assert match_sensitive("Search") is None
+
+
+def test_gated_decision_is_held_then_force_executes(runner):
+    d = {**decision("e3"), "operation": "CLICK",
+         "gate": {"verdict": "confirm", "reasons": ["sensitive 'delete' action"]}}
+    runner.state["decision"] = d
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "confirm" and snap["gate"]["verdict"] == "confirm"
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["decision"] is d  # held for approval, not consumed
+
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"],
+                           "force": True})
+    assert runner.state["browser"].act.call_count == 1
+
+
+def test_done_failing_verify_escalates(runner):
+    runner.state["verify"] = {"text": "Order placed"}
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE"}
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "escalate"
+    assert "verify" in snap["gate"]["reasons"][0]
+
+
+def test_done_passing_verify_finishes(runner):
+    runner.state["verify"] = {"text": "Search"}
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE"}
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "done"
+
+
+def test_verify_passing_after_action_finishes_without_done(runner):
+    seen = page()
+    seen["text"] = "Order placed"
+    runner.state["verify"] = {"text": "Order placed"}
+    runner.state["browser"].observe.return_value = seen
+    runner.state["decision"] = decision("e3")
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "done"
+
+
+def test_predict_short_circuits_on_verify(runner, monkeypatch):
+    runner.state["verify"] = {"text": "Search"}
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    choose = Mock(side_effect=AssertionError("no paid call when verify already passes"))
+    monkeypatch.setattr(loop, "choose", choose)
+    snap = runner.command("predict", {})
+    assert snap["status"] == "done" and snap["gate"]["verdict"] == "done"
+    choose.assert_not_called()
+
+
+def test_review_operation_returns_confirm_even_under_force(runner):
+    runner.state["decision"] = {**decision("REVIEW"), "operation": "REVIEW",
+                                "gate": {"verdict": "confirm", "reasons": ["model chose REVIEW"]}}
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"],
+                                  "force": True})
+    assert snap["status"] == "confirm"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_done_without_verify_is_reported_unverified(runner):
+    runner.state["decision"] = {**decision("DONE"), "operation": "DONE"}
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "done" and snap["verified"] is False
+
+
+def test_origin_allowlist():
+    from jev_ultrafast.policy import origin_allowed
+    patterns = ["https://*.example.com", "http://localhost:8080"]
+    assert origin_allowed("https://shop.example.com/a", patterns)
+    assert origin_allowed("http://localhost:8080/x", patterns)
+    assert origin_allowed("data:text/html,<b>x</b>", patterns)  # internal fixtures pass
+    assert not origin_allowed("https://evil.com/", patterns)
+    assert not origin_allowed("https://example.com.evil.com/", patterns)
+    assert not origin_allowed("javascript:alert(1)", patterns)
+    assert origin_allowed("https://anything.test/", None)
+    assert origin_allowed("https://anything.test/", [])
+
+
+def test_direct_cdp_captures_diagnostic_logs():
+    from jev_ultrafast.browser import DirectCDP
+    conn = DirectCDP.__new__(DirectCDP)
+    conn.logs, conn._log_id = [], 0
+    conn._capture_log("Runtime.consoleAPICalled",
+                      {"type": "error", "args": [{"value": "boom"}]})
+    conn._capture_log("Runtime.exceptionThrown",
+                      {"exceptionDetails": {"text": "Uncaught TypeError"}})
+    conn._capture_log("Network.loadingFailed", {"errorText": "net::ERR_FAILED"})
+    conn._capture_log("Page.frameNavigated", {"frame": {"url": "https://x.test/"}})
+    conn._capture_log("Page.frameNavigated",
+                      {"frame": {"url": "https://x.test/f", "parentId": "p"}})
+    conn._capture_log("Browser.downloadWillBegin", {"suggestedFilename": "a.exe"})
+    conn._capture_log("Target.attachedToTarget", {})  # ignored
+    types = [e["type"] for e in conn.logs]
+    assert types == ["console", "pageerror", "requestfailed",
+                     "navigation", "download"]
+    assert conn.logs[0]["text"] == "boom" and conn.logs[1]["level"] == "error"
+
+
+def test_offscreen_controls_reach_the_model_state(monkeypatch):
+    p = page()
+    p["offscreen"] = {"above": [], "below": ["Checkout", "Place order"]}
+    seen = {}
+
+    def post(_url, _key, body):
+        seen.update(body["state"]["page"])
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(["1", "2"], "2"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(p, "Check out", [])
+    assert seen["offscreen"]["below"] == ["Checkout", "Place order"]
+    seen.clear()
+    p["offscreen"] = {"above": [], "below": []}
+    model.choose(p, "Check out", [])
+    assert "offscreen" not in seen  # empty lists are not sent
+
+
+def test_review_is_an_offered_operation(monkeypatch):
+    def post(_url, _key, body):
+        assert "REVIEW" in body["questions"]["operation"]["criteria"]
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "REVIEW"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Delete everything", [])
+    assert d["operation"] == "REVIEW" and d["choice"] == "REVIEW"

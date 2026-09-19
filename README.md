@@ -24,7 +24,7 @@ Every observation produces a new element table:
 ...
 ```
 
-The operations are `CLICK`, `TYPE_TEXT`, `SELECT`, `SCROLL_UP`, `SCROLL_DOWN`, `PRESS_KEY`, `WAIT`, `DONE`, and `BLOCKED`. Only supported operations and targets are offered.
+Element operations: `CLICK`, `RIGHT_CLICK`, `DOUBLE_CLICK`, `HOVER`, `DRAG` (source + target heads), `TYPE_TEXT`, `UPLOAD_FILE`, `SELECT`, `PRESS_KEY` (single keys and offered VS Code chords). Page controls: `SCROLL_UP/DOWN/LEFT/RIGHT` (page and nested containers), `BACK`, `FORWARD`, `RELOAD`, `WAIT`, `REVIEW`, `DONE`, `BLOCKED`. Only supported operations and targets are offered; pointer operations reuse the CLICK target space. `REVIEW` lets the model itself defer a step to human judgment — it never mutates the page, even under `approve=True`. Each snapshot also names controls just outside the viewport (`offscreen.above/below`), so scrolling is an informed choice rather than a blind probe.
 
 ```text
                       one TypeSafe request
@@ -43,6 +43,10 @@ page → element table → operation                 │
 ```
 
 Target questions are speculative. If the operation is `CLICK`, only `click_target` can execute. Two decisions, **one network round trip**. Each target head contains only compatible elements. Native dropdown choices carry an observed element/option index.
+
+The same request also asks two graded judgments — `done` and `risk` nouls — and the choice answers carry confidence. A deterministic policy gate ([policy.py](jev_ultrafast/policy.py)) thresholds them in code: `done ≥ 0.9` finishes, a sensitive target label or `risk ≥ 0.2` holds the action for caller approval (`confirm`), low confidence escalates or stops. Held decisions are not consumed — `browser_step(approve=True)` executes them after review. A caller-supplied `verify` check (`{"text": ...}`, `{"url_contains": ...}`) is evaluated on every observation: it can finish the task without a model call, and a `DONE` that fails it escalates instead of ending the run. A `done` status without `verify` carries `verified: false` — it is the model's claim, not proof. `browser_step(dry_run=True)` previews the decision and gate verdict without executing; `browser_step(min_confidence=...)` raises the confidence floor for a session.
+
+`browser_start(allowed_origins=["https://*.example.com"])` pins a task to URL patterns: a page that lands anywhere else — including by redirect — returns `confirm` instead of acting. Owned browsers deny downloads via `Browser.setDownloadBehavior`, and every session keeps a bounded diagnostic ring of console messages, page errors, failed requests, navigations, dialogs, and blocked downloads, readable through `browser_logs(session_id, after_id)`.
 
 There are no site-specific action scripts or prepared field strings in the policy. The Flights example supplies a goal and independently verifies the outcome. The screenshot renderer adds labels afterward; it does not drive the browser.
 
@@ -119,7 +123,8 @@ Every executed target is resolved from an observed node. The executor rechecks p
 | [agent.py](jev_ultrafast/agent.py) | The complete loop and text-helper handoff |
 | [snapshot.js](jev_ultrafast/snapshot.js) | Atomic DOM snapshot, indexed controls, freshness guards |
 | [browser.py](jev_ultrafast/browser.py) | Browser connection, current geometry, execution |
-| [model.py](jev_ultrafast/model.py) | Dynamic operation/target heads and text generation |
+| [model.py](jev_ultrafast/model.py) | Dynamic operation/target heads, done/risk judgments, and text generation |
+| [policy.py](jev_ultrafast/policy.py) | Thresholds and sensitive-label gate over the model's typed outputs |
 | [questions.py](jev_ultrafast/questions.py) | Model instructions |
 | [demo.py](jev_ultrafast/demo.py) | Local inspector |
 | [mcp_server.py](mcp_server.py) | MCP tools: browser sessions, text handoff, `vscode_start` |
@@ -132,7 +137,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, and pop-up tabs remain outside this MVP. Nested scrolling covers up to three visible containers; keyboard support is the eight keys in PRESS_KEY (no modifiers). Owned tabs share the existing Chrome profile.
+A `DONE` choice still requires independent outcome verification — pass `verify` to `browser_start`/`browser_step` so code, not the model, decides completion. The DOM reader handles common HTML and ARIA controls plus same-origin iframes and shadow roots, not the full accessible-name specification. Canvas and cross-origin frames remain outside the action space. Nested scrolling covers up to three visible containers per direction; PRESS_KEY offers fixed keys and VS Code chords, not arbitrary input. Owned tabs share the dedicated automation profile.
 
 ## Development
 

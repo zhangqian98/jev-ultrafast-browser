@@ -6,14 +6,16 @@
     const id=cache.ids.get(e); cache.nodes.set(id,e); return id;
   };
   for (const [id,e] of cache.nodes) if (!e.isConnected) cache.nodes.delete(id);
-  const safe = e => !['password','file','hidden'].includes(e.type);
+  const safe = e => !['password','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   const name = (e,seen=new Set()) => {
     if (!e || seen.has(e)) return '';
     seen.add(e);
+    const root=e.getRootNode();
     const referenced=(e.getAttribute('aria-labelledby')||'').split(/\s+/)
-      .map(id=>name(document.getElementById(id),seen)).filter(Boolean).join(' ');
+      .map(id=>name((root.getElementById?root:document).getElementById(id),seen))
+      .filter(Boolean).join(' ');
     return referenced || e.getAttribute('aria-label') ||
       [...(e.labels||[])].map(l=>name(l,seen)).filter(Boolean).join(' ') ||
       (['button','submit','reset'].includes(e.type) ? e.value : '') || e.getAttribute('alt') ||
@@ -37,13 +39,22 @@
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
+      if (e.type==='file') return 'button';
       if (['text','email','url','tel'].includes(e.type)) return 'textbox';
     }
     return null;
   };
   cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    [...document.querySelectorAll('input,textarea,select')].filter(safe)
+    docs.flatMap(d=>[...d.querySelectorAll('input,textarea,select')]).filter(safe)
       .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+  cache.abs=e=>{
+    let r=e.getBoundingClientRect(), x=r.x, y=r.y, d=e.ownerDocument;
+    while (d?.defaultView?.frameElement) {
+      const fr=d.defaultView.frameElement.getBoundingClientRect();
+      x+=fr.x; y+=fr.y; d=d.defaultView.frameElement.ownerDocument;
+    }
+    return {x,y,w:r.width,h:r.height};
+  };
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
@@ -52,8 +63,27 @@
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
-  const actions=[];
-  for (const e of document.querySelectorAll(selector)) {
+  // Elements live in the top document, shadow roots, and same-origin iframe documents.
+  const docs=[document], found=[];
+  const walk=root=>{
+    for (const e of root.querySelectorAll('*')) {
+      if (e.matches(selector)) found.push(e);
+      if (e.shadowRoot) { docs.push(e.shadowRoot); walk(e.shadowRoot); }
+      if (e.tagName==='IFRAME') {
+        try { if (e.contentDocument) { docs.push(e.contentDocument); walk(e.contentDocument); } }
+        catch { /* cross-origin frame */ }
+      }
+    }
+  };
+  walk(document);
+  const actions=[], offscreen={above:[],below:[]};
+  // Controls outside the viewport get named (not indexed) so scroll choices are informed.
+  const noteOffscreen=(e,rname,cy)=>{
+    const direction=cy<0?'above':'below', label=(name(e)||rname).slice(0,120);
+    if (label && offscreen[direction].length<40 && !offscreen[direction].includes(label))
+      offscreen[direction].push(label);
+  };
+  for (const e of found) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const rname=role(e);
     if (!rname) continue;
@@ -70,8 +100,14 @@
       if (!g) continue;
     }
     const x=r.x+r.width/2, y=r.y+r.height/2;
-    if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
-    const hit=document.elementFromPoint(x,y);
+    const root=g.getRootNode(), win=root.nodeType===11 ? root.ownerDocument.defaultView : root.defaultView;
+    const abs=cache.abs(g);
+    if (x<0 || y<0 || x>=win.innerWidth || y>=win.innerHeight ||
+        abs.x+abs.w/2<0 || abs.x>=innerWidth || abs.y+abs.h/2<0 || abs.y+abs.h/2>=innerHeight) {
+      noteOffscreen(e,rname,abs.y+abs.h/2);
+      continue;
+    }
+    const hit=root.elementFromPoint(x,y);
     if (!hit || !g.contains(hit)) continue;
     if (['gridcell','listitem','row'].includes(rname) && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
@@ -98,14 +134,17 @@
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
-  const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
-  const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
-    const value=node.textContent.trim(), parent=node.parentElement;
-    if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
-    range.selectNodeContents(node); const r=range.getBoundingClientRect();
-    if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
-      words.push(value); length+=value.length;
+  const words=[]; let node,length=0;
+  for (const d of docs) {
+    if (!d.body) continue;
+    const range=d.createRange(), walker=d.createTreeWalker(d.body,4), vw=d.defaultView;
+    while ((node=walker.nextNode()) && length<6000) {
+      const value=node.textContent.trim(), parent=node.parentElement;
+      if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
+      range.selectNodeContents(node); const r=range.getBoundingClientRect();
+      if (r.width>0 && r.height>0 && r.bottom>0 && r.top<vw.innerHeight && r.right>0 && r.left<vw.innerWidth) {
+        words.push(value); length+=value.length;
+      }
     }
   }
   const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight,
@@ -134,13 +173,17 @@
       actions.push({id:'key_'+key.toLowerCase().replaceAll('+','_'),kind:'key',key,
         label:'Press '+key});
   const containers=[];
-  for (const e of document.body.querySelectorAll('*')) {
-    if (e.scrollHeight<=e.clientHeight+2 || !visible(e)) continue;
-    const r=e.getBoundingClientRect();
-    const w=Math.min(r.right,innerWidth)-Math.max(r.left,0),
-      h=Math.min(r.bottom,innerHeight)-Math.max(r.top,0);
+  for (const e of docs.flatMap(d=>d.body ? [...d.body.querySelectorAll('*')] : [])) {
+    if (e.scrollHeight<=e.clientHeight+2 && e.scrollWidth<=e.clientWidth+2) continue;
+    if (!visible(e)) continue;
+    const r=e.getBoundingClientRect(), vw=e.ownerDocument.defaultView;
+    const w=Math.min(r.right,vw.innerWidth)-Math.max(r.left,0),
+      h=Math.min(r.bottom,vw.innerHeight)-Math.max(r.top,0);
     if (w<120 || h<80) continue;
-    if (!['auto','scroll'].includes(getComputedStyle(e).overflowY) &&
+    const overflow=getComputedStyle(e);
+    const scrollsX=['auto','scroll'].includes(overflow.overflowX) && e.scrollWidth>e.clientWidth+2;
+    const scrollsY=['auto','scroll'].includes(overflow.overflowY) && e.scrollHeight>e.clientHeight+2;
+    if (!scrollsX && !scrollsY &&
         !['tree','listbox','list','grid','menu'].includes(e.getAttribute('role'))) continue;
     containers.push({e,area:w*h});
   }
@@ -172,5 +215,5 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,offscreen};
 })()

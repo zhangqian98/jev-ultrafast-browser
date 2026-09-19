@@ -7,7 +7,22 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_texts
+from .policy import evaluate_policy
 from .questions import MAX_STEPS
+
+TERMINAL_STATUSES = {"done", "blocked", "confirm", "escalate"}
+
+
+def _verify(page, spec):
+    """Caller-supplied success check, e.g. {"text": "Saved", "url_contains": "/done"}.
+    Every given condition must hold; returns None when no spec is configured."""
+    if not spec:
+        return None
+    if spec.get("text") and spec["text"] not in page.get("text", ""):
+        return False
+    if spec.get("url_contains") and spec["url_contains"] not in page.get("url", ""):
+        return False
+    return True
 
 
 def _text_key(context):
@@ -20,8 +35,8 @@ def _text_key(context):
 class Agent:
     def __init__(self, url, goals, *, cdp_url=None, attach=None, record_dir=None, screenshots=False):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
-        if not task:
-            raise ValueError("Supply a task")
+        if not 1 <= len(task) <= 12000:
+            raise ValueError("The goal must contain 1-12000 characters")
         plan = [task]
         self.pending_text = None
         self.text_cache = {}
@@ -56,6 +71,9 @@ class Agent:
     def snapshot(self):
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
+            "gate": self.state.get("gate"),
+            "verify": self.state.get("verify"),
+            "verified": self.state.get("verified"),
             "elements": action_space(self.state["page"]["actions"])[0],
         }
 
@@ -65,6 +83,8 @@ class Agent:
         if name == "tick":
             try:
                 self.command("predict", {})
+                if state["status"] == "done":
+                    return self.snapshot()
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 state["decision"] = None
@@ -81,14 +101,39 @@ class Agent:
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
+            # Caller-supplied success check runs before any paid decision call.
+            if _verify(state["page"], state.get("verify")):
+                state["status"] = "done"
+                state["verified"] = True
+                state["gate"] = {"verdict": "done", "reasons": ["verify check passed"]}
+                return self.snapshot()
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
             state["decision"] = choose(state["page"], state["goal"], state["history"])
+            decision = state["decision"]
+            label = decision["choice"]
+            if decision["choice"] not in {"DONE", "BLOCKED"}:
+                hit = next((a for a in state["page"]["actions"]
+                            if a["id"] == decision["choice"]), None)
+                if hit:
+                    label = hit["label"]
+                if decision["operation"] == "DRAG":
+                    drop = next((a for a in state["page"]["actions"]
+                                 if a["id"] == decision["drop"]), None)
+                    if drop:
+                        label = f"{label} onto {drop['label']}"
+            confidence = decision.get("target_confidence")
+            if confidence is None:
+                confidence = decision["confidence"]
+            decision["gate"] = evaluate_policy(
+                operation=decision["operation"], label=label,
+                done=decision.get("done_p"), risk=decision.get("risk_p"),
+                confidence=confidence, thresholds=state.get("thresholds"))
             state["decisions"].append(
                 {
-                    **state["decision"],
+                    **decision,
                     "fingerprint": state["page"]["fingerprint"],
                     "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                 }
@@ -98,15 +143,39 @@ class Agent:
             decision, page = state["decision"], state["page"]
             if not decision or body.get("fingerprint") != page["fingerprint"]:
                 raise ValueError("Observe and choose before acting")
+            gate = decision.get("gate") or {"verdict": "proceed", "reasons": []}
+            verdict = gate["verdict"]
+            state["gate"] = gate
+            if (not body.get("force") and not decision.get("approved")
+                    and verdict in {"confirm", "escalate", "stop"}):
+                # Held, not consumed: browser_step(approve=true) can still execute it.
+                state["status"] = "blocked" if verdict == "stop" else verdict
+                return self.snapshot()
             # Consume once, before any mutation or model call. A retry cannot double-click.
             state["decision"] = None
             selected = decision["choice"]
-            if selected in {"DONE", "BLOCKED"}:
+            if selected == "REVIEW" and verdict != "done":
+                # REVIEW carries no target; there is nothing to execute even under force.
+                state["status"] = "confirm"
+                state["gate"] = {"verdict": "confirm",
+                                 "reasons": ["Jev returned REVIEW: inspect the page and "
+                                            "authorize the next action yourself"]}
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
+            if selected in {"DONE", "BLOCKED"} or verdict == "done":
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
-                state["status"] = "done" if selected == "DONE" else "blocked"
-                state["plan_index"] = int(selected == "DONE")
+                wants_done = verdict == "done" or selected == "DONE"
+                if wants_done and _verify(page, state.get("verify")) is False:
+                    state["status"] = "escalate"
+                    state["gate"] = {"verdict": "escalate",
+                                     "reasons": ["model reported done but the verify check failed"]}
+                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                    return self.snapshot()
+                state["status"] = "done" if wants_done else "blocked"
+                state["verified"] = wants_done and state.get("verify") is not None
+                state["plan_index"] = int(wants_done)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
@@ -197,6 +266,11 @@ class Agent:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
                 )
+            if _verify(state["page"], state.get("verify")):
+                state["status"] = "done"
+                state["verified"] = True
+                state["gate"] = {"verdict": "done", "reasons": ["verify check passed"]}
+                return self.snapshot()
             repeated = state["history"][-3:]
             state["status"] = (
                 "blocked"
@@ -208,7 +282,7 @@ class Agent:
         return self.snapshot()
 
     def run(self):
-        while self.state["status"] not in {"done", "blocked"}:
+        while self.state["status"] not in TERMINAL_STATUSES:
             yield self.command("tick")
 
     def close(self):

@@ -7,9 +7,31 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
+from .questions import DONE_JUDGMENT, NEXT_ACTION, RISK_JUDGMENT, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+
+# TypeSafe pricing: $42 per billion input tokens; output is free.
+PRICE_PER_INPUT_TOKEN_USD = 0.042 / 1e6
+
+
+def input_cost_usd(usage):
+    tokens = (usage or {}).get("input_tokens", (usage or {}).get("inputTokens", 0)) or 0
+    return tokens * PRICE_PER_INPUT_TOKEN_USD
+
+
+def noul_value(answer):
+    """Parse a noul answer to a 0..1 probability; absent answers return None so
+    test doubles can omit them, malformed ones are rejected like bad choices."""
+    if not isinstance(answer, dict):
+        return None
+    value = answer.get("noul", answer.get("probability"))
+    if value is None:
+        return None
+    number = float(value)
+    if not math.isfinite(number) or not 0 <= number <= 1:
+        raise ValueError("Invalid TypeSafe response; no action executed.")
+    return number
 
 
 def post_json(url, key, body):
@@ -108,7 +130,12 @@ def choose(state, goal, history):
         operations.update({key: labels[key]
                            for key in ("RIGHT_CLICK", "DOUBLE_CLICK", "HOVER", "DRAG")})
     operations.update({key: value["label"] for key, value in controls.items()})
-    operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    operations.update(
+        DONE="Every requirement is visibly satisfied.",
+        BLOCKED="No supported operation can progress.",
+        REVIEW="Return control for human review before a consequential action: sending, "
+               "posting, submitting an order or payment, booking, deletion, permission "
+               "changes, sensitive-data entry, CAPTCHA, or security warnings.")
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
@@ -138,10 +165,17 @@ def choose(state, goal, history):
                 "instructions": {"goal": goal, "operation": "DRAG", "role": role,
                                  "rules": [NEXT_ACTION, TARGET]},
             }
+    # Graded judgments alongside the choices; the policy gate thresholds them in code.
+    questions["done"] = {"type": "noul", "instructions": {"goal": goal, "rules": DONE_JUDGMENT}}
+    questions["risk"] = {"type": "noul", "instructions": {"goal": goal, "rules": RISK_JUDGMENT}}
+    page = {k: state[k] for k in ("url", "title", "text")}
+    offscreen = state.get("offscreen") or {}
+    if offscreen.get("above") or offscreen.get("below"):
+        page["offscreen"] = offscreen
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
-            "page": {k: state[k] for k in ("url", "title", "text")},
+            "page": page,
             "elements": elements,
             "recent_actions": [
                 {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
@@ -181,11 +215,14 @@ def choose(state, goal, history):
         else:
             choice = controls[operation]["id"] if operation in controls else operation
             probabilities[choice] = operation_answer["probabilities"][operation]
+    usage = result.get("usage", {})
     return {
         "choice": choice,
         "drop": drop,
         "operation": operation,
         "target": target,
+        "done_p": noul_value(result["answers"].get("done")),
+        "risk_p": noul_value(result["answers"].get("risk")),
         "confidence": operation_answer["confidence"],
         "probabilities": probabilities,
         "operation_probabilities": operation_answer["probabilities"],
@@ -193,7 +230,8 @@ def choose(state, goal, history):
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "raw_answers": result["answers"],
         "model": result["model"],
-        "usage": result.get("usage", {}),
+        "usage": usage,
+        "cost_usd": input_cost_usd(usage),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
     }

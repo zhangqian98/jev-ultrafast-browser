@@ -46,6 +46,8 @@ class DirectCDP:
             info["webSocketDebuggerUrl"], max_size=None, open_timeout=timeout)
         self.timeout, self.next_id = timeout, 0
         self.events = []
+        self.dialog_accept = {"accept": False}
+        self.logs, self._log_id = [], 0
 
     @classmethod
     def from_ws_url(cls, url, timeout=30):
@@ -53,7 +55,47 @@ class DirectCDP:
         cdp_.ws = websockets.sync.client.connect(url, max_size=None, open_timeout=timeout)
         cdp_.timeout, cdp_.next_id = timeout, 0
         cdp_.events = []
+        cdp_.dialog_accept = {"accept": False}
+        cdp_.logs, cdp_._log_id = [], 0
         return cdp_
+
+    def _capture_log(self, method, params):
+        """Translate CDP events into a bounded diagnostic log ring."""
+        kind = level = text = url = None
+        if method == "Runtime.consoleAPICalled":
+            kind, level = "console", params.get("type", "log")
+            text = " ".join(str(a.get("value", a.get("description", "")))
+                            for a in params.get("args", []))
+        elif method == "Runtime.exceptionThrown":
+            kind, level = "pageerror", "error"
+            details = params.get("exceptionDetails", {})
+            text = details.get("text", "") + " " + str(
+                (details.get("exception") or {}).get("description", ""))
+        elif method == "Log.entryAdded":
+            entry = params.get("entry", {})
+            kind, level, url = "log", entry.get("level", "info"), entry.get("url")
+            text = entry.get("text", "")
+        elif method == "Network.loadingFailed":
+            kind, level = "requestfailed", "error"
+            text = params.get("errorText", "request failed")
+        elif method == "Page.frameNavigated":
+            frame = params.get("frame", {})
+            if frame.get("parentId"):
+                return
+            kind, level, text = "navigation", "info", frame.get("url", "")
+        elif method == "Page.javascriptDialogOpening":
+            kind, level, text = "dialog", "info", params.get("message", "")
+        elif method.startswith("Browser.download"):
+            kind, level = "download", "blocked"
+            text = params.get("suggestedFilename") or params.get("url", "download attempt")
+        if kind is None:
+            return
+        self._log_id += 1
+        self.logs.append({"id": self._log_id, "ts": round(time.time(), 3),
+                          "type": kind, "level": level,
+                          "text": str(text).strip()[:500], "url": url})
+        if len(self.logs) > 1000:
+            del self.logs[: len(self.logs) - 1000]
 
     def __call__(self, method, session_id=None, _response_timeout=None, **params):
         self.next_id += 1
@@ -68,15 +110,17 @@ class DirectCDP:
                 # A modal dialog blocks all evaluation; dismiss it in-band so calls unblock.
                 self.next_id += 1
                 dismiss = {"id": self.next_id, "method": "Page.handleJavaScriptDialog",
-                           "params": {"accept": False}}
+                           "params": dict(self.dialog_accept)}
                 if reply.get("sessionId"):
                     dismiss["sessionId"] = reply["sessionId"]
                 self.events.append(reply)
+                self._capture_log(reply["method"], reply.get("params") or {})
                 self.ws.send(json.dumps(dismiss))
                 continue
             if reply.get("id") != self.next_id:
                 if "method" in reply:
                     self.events.append(reply)
+                    self._capture_log(reply["method"], reply.get("params") or {})
                 continue  # events and stale replies
             if "error" in reply:
                 raise RuntimeError(reply["error"].get("message", reply["error"]))
@@ -122,6 +166,7 @@ class Browser:
         self.session = None
         self._owned_targets = set()
         self._known_targets = set()
+        self.dialogs = []
         if attach is not None:
             self.owned = False
             targets = self.cdp("Target.getTargets").get("targetInfos", [])
@@ -143,10 +188,17 @@ class Browser:
             # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
             self.call("Page.navigate", url=url, _response_timeout=30)
-        try:
-            self.call("Page.enable")  # required for dialog events
-        except RuntimeError:
-            pass
+        # Page.enable is required for dialog events; the rest feed the diagnostic log ring.
+        for domain in ("Page.enable", "Runtime.enable", "Log.enable", "Network.enable"):
+            try:
+                self.call(domain)
+            except RuntimeError:
+                pass
+        if self.owned and isinstance(self.cdp, DirectCDP):
+            try:
+                self.cdp("Browser.setDownloadBehavior", behavior="deny", eventsEnabled=True)
+            except RuntimeError:
+                pass
         self.follow = self.owned  # only dedicated automation browsers get new tabs
         self._known_targets = {t["targetId"] for t in self._pages()}
         self._settle()
@@ -166,10 +218,11 @@ class Browser:
             pass
         self.target, self.session = target_id, session
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        try:
-            self.call("Page.enable")
-        except RuntimeError:
-            pass
+        for domain in ("Page.enable", "Runtime.enable", "Log.enable", "Network.enable"):
+            try:
+                self.call(domain)
+            except RuntimeError:
+                pass
 
     def _maybe_retarget(self):
         """Follow tabs the page opened (window.open, target=_blank, ctrl+click)."""
@@ -254,10 +307,21 @@ class Browser:
         self._maybe_retarget()
         for attempt in range(10):
             try:
-                return browser_operation(
+                state = browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot,
                      "cdp": self.cdp}
                 )
+                if isinstance(self.cdp, DirectCDP):
+                    fresh = [e["params"] for e in self.cdp.events
+                             if e.get("method") == "Page.javascriptDialogOpening"]
+                    if fresh:
+                        self.dialogs.extend(fresh)
+                        self.cdp.events = [
+                            e for e in self.cdp.events
+                            if e.get("method") != "Page.javascriptDialogOpening"]
+                    if self.dialogs:
+                        state["dialogs"] = self.dialogs
+                return state
             except StalePage:
                 if attempt == 9:
                     raise
@@ -286,6 +350,12 @@ class Browser:
                                     "text": text, "cdp": self.cdp})
         self.after_input = action if action["kind"] != "wait" else None
         return result
+
+    def logs(self, after_id=0, limit=200):
+        entries = getattr(self.cdp, "logs", [])
+        entries = [e for e in entries if e["id"] > after_id][:limit]
+        return {"logs": entries,
+                "last_id": entries[-1]["id"] if entries else after_id}
 
     def close(self):
         if not self.target:
@@ -334,8 +404,7 @@ def browser_operation(request):
         if kind == "scroll":
             node = action.get("node")
             if node is None:
-                call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650,
-                     deltaX=action.get("dx", 0), deltaY=action["delta"])
+                x, y, pos_expr = 550, 650, "scrollY+','+scrollX"
             else:
                 if type(node) is not int:
                     raise ValueError("Invalid observed node")
@@ -343,14 +412,27 @@ def browser_operation(request):
                   const e=window.__jevFast?.nodes.get(node);
                   if (!e?.isConnected ||
                       !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-                  const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-                  return r.width && r.height && x>=0 && y>=0 && x<innerWidth && y<innerHeight
+                  const r=window.__jevFast.abs(e), x=r.x+r.w/2, y=r.y+r.h/2;
+                  return r.w && r.h && x>=0 && y>=0 && x<innerWidth && y<innerHeight
                     ? {x,y} : null;
                 })(""" + json.dumps(node) + ")")
                 if center is None:
                     raise StalePage("Scroll container changed. Observe again.")
-                call("Input.dispatchMouseEvent", type="mouseWheel", x=center["x"], y=center["y"],
+                x, y = center["x"], center["y"]
+                pos_expr = ("(() => { const e=window.__jevFast?.nodes.get("
+                            + json.dumps(node) + "); return e ? e.scrollTop+','+e.scrollLeft : null; })()")
+            # The wheel must hover first; the renderer also needs a beat between the move
+            # and the wheel or it drops the event. If it still drops one, a scroll that
+            # demonstrably did not happen is safe to dispatch again.
+            before = evaluate(pos_expr)
+            for _attempt in range(2):
+                call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+                time.sleep(0.05)
+                call("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y,
                      deltaX=action.get("dx", 0), deltaY=action["delta"])
+                time.sleep(0.08)
+                if evaluate(pos_expr) != before:
+                    break
         elif kind == "file":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -376,8 +458,8 @@ def browser_operation(request):
                   !s.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
                   !sg.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
                   !d.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              const c=e=>{const r=e.getBoundingClientRect();
-                return {x:r.x+r.width/2,y:r.y+r.height/2,w:r.width,h:r.height}};
+              const c=e=>{const r=window.__jevFast.abs(e);
+                return {x:r.x+r.w/2,y:r.y+r.h/2,w:r.w,h:r.h}};
               const a=c(sg), b=c(d);
               if (!a.w||!a.h||!b.w||!b.h||a.x<0||a.y<0||a.x>=innerWidth||a.y>=innerHeight||
                   b.x<0||b.y<0||b.x>=innerWidth||b.y>=innerHeight) return null;
@@ -411,9 +493,14 @@ def browser_operation(request):
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
                   !g.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=g.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!g.contains(document.elementFromPoint(x,y))) return null;
+              const r=g.getBoundingClientRect();
+              if (!r.width || !r.height) return null;
+              const root=g.getRootNode(), win=root.nodeType===11?root.ownerDocument.defaultView:root.defaultView;
+              const lx=r.x+r.width/2, ly=r.y+r.height/2;
+              if (lx<0 || ly<0 || lx>=win.innerWidth || ly>=win.innerHeight) return null;
+              if (!g.contains(root.elementFromPoint(lx,ly))) return null;
+              const ar=window.__jevFast.abs(g), x=ar.x+ar.w/2, y=ar.y+ar.h/2;
+              if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;
