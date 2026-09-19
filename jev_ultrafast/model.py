@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+from .questions import NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
@@ -17,6 +17,9 @@ def post_json(url, key, body):
         try:
             response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
         except httpx.HTTPError:
+            if attempt < 2:
+                time.sleep(0.5 * 2**attempt)
+                continue
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
@@ -51,6 +54,9 @@ def action_space(actions):
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
     for action in actions:
         kind = action["kind"]
+        if kind == "key":
+            targets.setdefault("PRESS_KEY", {})[action["key"]] = action
+            continue
         if kind not in operations:
             controls[action["id"].upper()] = action
             continue
@@ -84,6 +90,9 @@ def choose(state, goal, history):
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select an observed dropdown value.",
+        "PRESS_KEY": "Press one key on the focused control: Enter confirms a focused input or "
+        "highlighted item, Escape dismisses a menu or dialog, arrows move within an open list "
+        "or menu, Tab moves focus.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
@@ -92,16 +101,20 @@ def choose(state, goal, history):
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
     for operation, candidates in targets.items():
-        questions[operation.lower() + "_target"] = {
-            "type": "choice",
-            "criteria": {
+        if operation == "PRESS_KEY":
+            criteria = {key: {"key": key} for key in candidates}
+        else:
+            criteria = {
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
                     **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
                 }
                 for index, a in candidates.items()
-            },
+            }
+        questions[operation.lower() + "_target"] = {
+            "type": "choice",
+            "criteria": criteria,
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
     body = {
@@ -157,7 +170,12 @@ def field_context(goal, action, page, history):
     }
 
 
-def field_text(context):
+def field_texts(contexts):
+    """One text-helper call for one or more field contexts (contexts[0] is the chosen field).
+
+    Returns (values, helper); values[i] is a non-empty string or None. values[0] is
+    guaranteed non-None or a ValueError is raised, matching the old field_text contract.
+    """
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
@@ -166,6 +184,16 @@ def field_text(context):
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    if len(contexts) == 1:
+        system, user = TEXT_VALUE, contexts[0]
+    else:
+        system = TEXT_VALUES
+        user = {
+            "goal": contexts[0]["goal"],
+            "page": contexts[0]["page"],
+            "recent_actions": contexts[0]["recent_actions"],
+            "fields": [{"index": i, **c["field"]} for i, c in enumerate(contexts)],
+        }
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
@@ -176,23 +204,36 @@ def field_text(context):
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [
-                {"role": "system", "content": TEXT_VALUE},
+                {"role": "system", "content": system},
                 {
                     "role": "user",
-                    "content": json.dumps(context),
+                    "content": json.dumps(user),
                 },
             ],
         },
     )
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
-        value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        if len(contexts) == 1:
+            if set(output) != {"text"}:
+                raise ValueError()
+            raw = [output["text"]]
+        else:
+            if set(output) != {"texts"} or set(output["texts"]) != {str(i) for i in range(len(contexts))}:
+                raise ValueError()
+            raw = [output["texts"][str(i)] for i in range(len(contexts))]
+        values = [v if isinstance(v, str) and v.strip() and len(v) <= 2000 else None for v in raw]
+        if values[0] is None:
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Text helper returned no valid field value; nothing typed.") from None
-    return value, {
+    return values, {
         "model": model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "usage": result.get("usage", {}),
     }
+
+
+def field_text(context):
+    value, helper = field_texts([context])
+    return value[0], helper

@@ -9,19 +9,22 @@ external TEXT_MODEL_* credentials needed.
 Run: uv run --project <repo> --with mcp python mcp_server.py
 """
 
+import json
 import os
 import secrets
+import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import jev_ultrafast.agent as agent_mod
 from jev_ultrafast.agent import Agent
-from jev_ultrafast.browser import StalePage
-from jev_ultrafast.model import field_context
+from jev_ultrafast.browser import KEYS, StalePage, press_key
+from jev_ultrafast.model import CLIENT, field_context
 
 _BROWSERS = (
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -29,6 +32,26 @@ _BROWSERS = (
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
 )
+
+
+def _ensure_cdp(base_url, launch_cmd):
+    """Probe base_url/json/version; if down, run launch_cmd and wait up to 20s."""
+    base = base_url.rstrip("/")
+    try:
+        urllib.request.urlopen(f"{base}/json/version", timeout=1)
+        return  # already up
+    except Exception:
+        pass
+    env = {k: v for k, v in os.environ.items() if k != "ELECTRON_RUN_AS_NODE"}
+    subprocess.Popen(launch_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(f"{base}/json/version", timeout=1)
+            return
+        except Exception:
+            time.sleep(0.3)
+    raise RuntimeError(f"CDP endpoint did not answer on {base}")
 
 
 def _ensure_browser():
@@ -40,36 +63,18 @@ def _ensure_browser():
     url = os.environ.get("BU_CDP_URL")
     if not url:
         return
-    base = url.rstrip("/")
-    try:
-        urllib.request.urlopen(f"{base}/json/version", timeout=1)
-        return  # already up
-    except Exception:
-        pass
-    port = urlparse(base).port or 9223
+    port = urlparse(url.rstrip("/")).port or 9223
     binary = next((b for b in _BROWSERS if os.path.isfile(b)), None)
     if not binary:
         raise RuntimeError("no Chrome/Edge binary found for BU_CDP_URL")
     profile = os.path.join(os.environ.get("LOCALAPPDATA", "."), "jev-ultrafast-profile")
-    subprocess.Popen(
-        [
-            binary,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(f"{base}/json/version", timeout=1)
-            return
-        except Exception:
-            time.sleep(0.3)
-    raise RuntimeError(f"automation browser did not open CDP on {base}")
+    _ensure_cdp(url, [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ])
 
 
 class NeedText(Exception):
@@ -78,14 +83,14 @@ class NeedText(Exception):
         self.context = context
 
 
-def _no_external_text_model(context):
+def _no_external_text_model(contexts):
     # Hard guarantee: TYPE_TEXT never calls an external LLM from this server.
-    raise NeedText(context)
+    raise NeedText(contexts[0] if isinstance(contexts, list) else contexts)
 
 
-agent_mod.field_text = _no_external_text_model
+agent_mod.field_text = agent_mod.field_texts = _no_external_text_model
 
-mcp = FastMCP("jev-ultrafast")
+mcp = MCPServer("jev-ultrafast")
 _sessions = {}
 
 
@@ -106,6 +111,7 @@ def _decision(d):
     return {
         "operation": d["operation"],
         "confidence": d["confidence"],
+        "latency_ms": d["latency_ms"],
         "operation_probabilities": d["operation_probabilities"],
     }
 
@@ -118,10 +124,90 @@ def browser_start(url: str, goal: str) -> dict:
     yourself and pass it to browser_supply_text.
     """
     _ensure_browser()
+    threading.Thread(target=_warm_model_conn, daemon=True).start()
     agent = Agent(url, goal)
     sid = secrets.token_hex(4)
     _sessions[sid] = {"agent": agent, "pending": None}
     return {"session_id": sid, **_view(agent)}
+
+
+def _warm_model_conn():
+    """First TypeSafe call in a fresh process pays ~1-2s of TLS/HTTP2 handshake; warm it
+    while the browser/VS Code launch happens anyway."""
+    try:
+        CLIENT.get("https://api.typesafe.ai/", timeout=10)
+    except Exception:
+        pass
+
+
+def _code_exe():
+    candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Microsoft VS Code\Code.exe"),
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    which = shutil.which("code")
+    if which:
+        path = os.path.normpath(os.path.join(os.path.dirname(which), "..", "Code.exe"))
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+@mcp.tool()
+def vscode_start(goal: str, workspace: str = "", port: int = 9333) -> dict:
+    """Launch desktop VS Code with CDP and attach the agent to its workbench.
+
+    Passes --disable-renderer-backgrounding, --disable-background-timer-throttling,
+    and --disable-backgrounding-occluded-windows so animations don't throttle while
+    the window is background or occluded, plus --force-renderer-accessibility so
+    Monaco editors expose real accessible names. On a fresh launch it also seeds
+    the profile's User/settings.json (never overwritten) so every run starts from
+    a clean Welcome state. Returns session_id plus the observed element table;
+    drive with browser_step and friends. For VS Code Web use
+    browser_start with https://vscode.dev.
+    """
+    base = f"http://127.0.0.1:{port}"
+    exe = _code_exe()
+    if not exe:
+        raise RuntimeError("Code.exe not found")
+    profile = os.path.join(os.environ.get("LOCALAPPDATA", "."), "jev-vscode-profile")
+    cmd = [exe, "--new-window", f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
+           "--disable-renderer-backgrounding", "--disable-background-timer-throttling",
+           "--disable-backgrounding-occluded-windows", "--force-renderer-accessibility"]
+    if workspace:
+        cmd.append(workspace)
+    try:
+        urllib.request.urlopen(f"{base}/json/version", timeout=1)
+        up = True
+    except Exception:
+        up = False
+    settings = os.path.join(profile, "User", "settings.json")
+    if not up and not os.path.exists(settings):
+        # A clean Welcome state on every fresh launch of the automation profile.
+        os.makedirs(os.path.dirname(settings), exist_ok=True)
+        with open(settings, "w") as f:
+            json.dump({"files.hotExit": "off", "window.restoreWindows": "none",
+                       "update.mode": "none", "workbench.startupEditor": "welcomePage"}, f)
+    threading.Thread(target=_warm_model_conn, daemon=True).start()
+    _ensure_cdp(base, cmd)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            targets = json.loads(urllib.request.urlopen(f"{base}/json/list", timeout=1).read())
+            if any(t.get("type") == "page" and "workbench.html" in t.get("url", "") for t in targets):
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    else:
+        raise RuntimeError(f"no workbench.html page on {base}")
+    agent = Agent(None, goal, cdp_url=base, attach="workbench.html")
+    sid = secrets.token_hex(4)
+    _sessions[sid] = {"agent": agent, "pending": None}
+    return {"session_id": sid, "target": "vscode", **_view(agent)}
 
 
 @mcp.tool()
@@ -136,6 +222,7 @@ def browser_step(session_id: str) -> dict:
         return {"status": "error", "error": "unknown session_id"}
     agent, st = s["agent"], None
     st = s["agent"].state
+    d = None
     try:
         agent.command("predict")
         d = st["decision"]
@@ -147,6 +234,7 @@ def browser_step(session_id: str) -> dict:
         if action["kind"] == "fill":
             ctx = field_context(st["goal"], action, st["page"], st["history"])
             s["pending"] = ctx
+            s["pending_node"] = action["node"]
             return {
                 "status": "need_text",
                 "decision": _decision(d),
@@ -158,9 +246,14 @@ def browser_step(session_id: str) -> dict:
         return {"status": st["status"], "decision": _decision(d), **_view(agent)}
     except StalePage:
         st["decision"] = None
-        st["status"] = "ready"
+        if st["status"] != "blocked":
+            st["status"] = "ready"
         st["page"] = st["browser"].observe(screenshot=False)
-        return {**_view(agent), "status": "stale_reobserved"}
+        out = {**_view(agent),
+               "status": "blocked" if st["status"] == "blocked" else "stale_reobserved"}
+        if d is not None:
+            out["decision"] = _decision(d)
+        return out
     except (ValueError, NeedText) as e:
         return {"status": "error", "error": str(e)}
 
@@ -180,24 +273,33 @@ def browser_supply_text(session_id: str, text: str) -> dict:
     try:
         agent.command("act", {"fingerprint": st["page"]["fingerprint"]})
     except StalePage:
-        s["pending"] = None
-        agent.pending_text = None
         st["decision"] = None
-        st["status"] = "ready"
+        if st["status"] != "blocked":
+            st["status"] = "ready"
         st["page"] = st["browser"].observe(screenshot=False)
-        return {**_view(agent), "status": "stale_reobserved"}
+        ctx = s["pending"]
+        # Same DOM node + byte-identical field context → the model's choice still holds;
+        # retry the fill without paying another decision call.
+        retry = next((a for a in st["page"]["actions"]
+                      if a["kind"] == "fill" and a["node"] == s.get("pending_node")
+                      and field_context(st["goal"], a, st["page"], st["history"]) == ctx), None)
+        if retry is None:
+            s["pending"] = s["pending_node"] = None
+            agent.pending_text = None
+            return {**_view(agent),
+                    "status": "blocked" if st["status"] == "blocked" else "stale_reobserved"}
+        st["decision"] = {"choice": retry["id"], "operation": "TYPE_TEXT", "target": "1",
+                          "confidence": 1.0, "probabilities": {retry["id"]: 1.0},
+                          "latency_ms": 0, "usage": {}}
+        return {"status": "need_text", "field": ctx["field"], "context": ctx,
+                "hint": "Same field survived the page change; call browser_supply_text again."}
     except NeedText:
         return {"status": "need_text", "error": "field context changed; call browser_step again"}
     s["pending"] = None
     return {"status": st["status"], **_view(agent)}
 
 
-_KEYS = {
-    "left": ("ArrowLeft", 37), "right": ("ArrowRight", 39),
-    "up": ("ArrowUp", 38), "down": ("ArrowDown", 40),
-    "enter": ("Enter", 13), "escape": ("Escape", 27),
-    "tab": ("Tab", 9), "backspace": ("Backspace", 8),
-}
+_KEY_ALIASES = {"left": "ArrowLeft", "right": "ArrowRight", "up": "ArrowUp", "down": "ArrowDown"}
 
 
 @mcp.tool()
@@ -210,14 +312,10 @@ def browser_press_key(session_id: str, key: str) -> dict:
     s = _sessions.get(session_id)
     if not s:
         return {"status": "error", "error": "unknown session_id"}
-    k = _KEYS.get(key.lower())
-    if not k:
+    name = _KEY_ALIASES.get(key.lower()) or next((k for k in KEYS if k.lower() == key.lower()), None)
+    if not name:
         return {"status": "error", "error": f"unsupported key '{key}'"}
-    name, vk = k
-    call = s["agent"].state["browser"].call
-    for t in ("rawKeyDown", "keyUp"):
-        call("Input.dispatchKeyEvent", type=t, key=name, code=name,
-             windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
+    press_key(s["agent"].state["browser"].call, name)
     time.sleep(0.15)
     return {"status": "ok", "key": name}
 

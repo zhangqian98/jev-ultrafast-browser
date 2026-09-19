@@ -22,7 +22,7 @@
       e.getAttribute('title') || e.getAttribute('placeholder') || '';
   };
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
-    'option','gridcell','combobox','textbox','searchbox','spinbutton'];
+    'option','gridcell','combobox','textbox','searchbox','spinbutton','treeitem','listitem','row'];
   const selector='a[href],button,input,textarea,select,summary,[contenteditable="true"],'+
     roles.map(role=>'[role="'+role+'"]').join(',');
   const role = e => {
@@ -55,11 +55,28 @@
   const actions=[];
   for (const e of document.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
-    const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
-    if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
-    if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
+    const rname=role(e);
+    if (!rname) continue;
+    let r=e.getBoundingClientRect(), g=e;
+    if (r.width<=0 || r.height<=0) {
+      // Monaco's edit-context textbox is 0-wide; click its visible ancestor instead.
+      if (!['textbox','searchbox','combobox'].includes(rname) &&
+          e.tagName!=='TEXTAREA' && !e.isContentEditable) continue;
+      g=null;
+      for (let p=e.parentElement,d=0; p && d<3; p=p.parentElement,d++) {
+        const pr=p.getBoundingClientRect();
+        if (pr.width>0 && pr.height>0) { g=p; r=pr; break; }
+      }
+      if (!g) continue;
+    }
+    const x=r.x+r.width/2, y=r.y+r.height/2;
+    if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    const hit=document.elementFromPoint(x,y);
+    if (!hit || !g.contains(hit)) continue;
+    if (['gridcell','listitem','row'].includes(rname) && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    if (g!==e) base.geom=identity(g);
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -101,6 +118,30 @@
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  if (document.activeElement && !['BODY','HTML'].includes(document.activeElement.tagName))
+    for (const key of ['Enter','Escape','Tab','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'])
+      actions.push({id:'key_'+key.toLowerCase(),kind:'key',key,label:'Press '+key});
+  const containers=[];
+  for (const e of document.body.querySelectorAll('*')) {
+    if (e.scrollHeight<=e.clientHeight+2 || !visible(e)) continue;
+    const r=e.getBoundingClientRect();
+    const w=Math.min(r.right,innerWidth)-Math.max(r.left,0),
+      h=Math.min(r.bottom,innerHeight)-Math.max(r.top,0);
+    if (w<120 || h<80) continue;
+    if (!['auto','scroll'].includes(getComputedStyle(e).overflowY) &&
+        !['tree','listbox','list','grid','menu'].includes(e.getAttribute('role'))) continue;
+    containers.push({e,area:w*h});
+  }
+  containers.sort((a,b)=>b.area-a.area);
+  for (const {e} of containers.slice(0,3)) {
+    const label=name(e)||e.getAttribute('role')||e.tagName.toLowerCase();
+    if (e.scrollTop+e.clientHeight<e.scrollHeight-2)
+      actions.push({id:'scroll_down_'+identity(e),kind:'scroll',node:identity(e),
+        delta:Math.round(e.clientHeight*0.7),label:'Scroll down in '+label});
+    if (e.scrollTop>0)
+      actions.push({id:'scroll_up_'+identity(e),kind:'scroll',node:identity(e),
+        delta:-Math.round(e.clientHeight*0.7),label:'Scroll up in '+label});
+  }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};

@@ -1,22 +1,31 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import json
 import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, choose, field_context, field_texts
 from .questions import MAX_STEPS
 
 
+def _text_key(context):
+    """Cache key for a generated field value: survives action history, dies with the
+    goal, the field, or the page text."""
+    return json.dumps({"goal": context["goal"], "field": context["field"],
+                       "page": context["page"]}, sort_keys=True)
+
+
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, cdp_url=None, attach=None, record_dir=None, screenshots=False):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url)
+        self.text_cache = {}
+        self.browser = Browser(url, cdp_url=cdp_url, attach=attach)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -31,6 +40,7 @@ class Agent:
             decision=None,
             history=[],
             status="ready",
+            stale=0,
             plan=plan,
             plan_index=0,
             decisions=[],
@@ -58,7 +68,8 @@ class Agent:
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 state["decision"] = None
-                state["status"] = "ready"
+                if state["status"] != "blocked":
+                    state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
@@ -107,14 +118,37 @@ class Agent:
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
+                key = _text_key(context)
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
+                elif key in self.text_cache:
+                    text, helper = self.text_cache.pop(key), {"model": "cached", "latency_ms": 0}
+                    state["text_calls"].append({**helper, "field": action["label"], "value": text})
                 else:
-                    text, helper = field_text(context)
+                    # Speculative batch: values for every other empty fill field come
+                    # back in the same helper call, cached by context for later steps.
+                    others = [a for a in page["actions"]
+                              if a["kind"] == "fill" and a["id"] != action["id"] and not a.get("value")]
+                    contexts = [context] + [
+                        field_context(state["goal"], a, page, state["history"]) for a in others]
+                    values, helper = field_texts(contexts)
+                    text = values[0]
+                    for c, v in zip(contexts[1:], values[1:]):
+                        if v is not None:
+                            self.text_cache[_text_key(c)] = v
+                    while len(self.text_cache) > 16:
+                        self.text_cache.pop(next(iter(self.text_cache)))
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            try:
+                state["browser"].act(action, page, text=text)
+            except StalePage:
+                state["stale"] = state.get("stale", 0) + 1
+                if state["stale"] >= 5:
+                    state["status"] = "blocked"
+                raise
+            state["stale"] = 0
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.

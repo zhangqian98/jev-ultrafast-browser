@@ -12,5 +12,8 @@ Read README.md before editing. Keep the loop small: page -> indexed elements -> 
 - Verify actual final outcomes independently. A DONE choice is not proof of success.
 - Keep examples, README claims, raw evidence, and model-call counts consistent.
 - Do not commit or push unless the user requests it.
+- Launching Code.exe from this environment: remove ELECTRON_RUN_AS_NODE from the env or every CLI option is rejected as "bad option".
+- VS Code desktop uses DirectCDP (raw websocket to --remote-debugging-port); Chrome still goes through browser-harness. scripts/check_vscode.py needs Code.exe on CDP :9333.
 
 Checks: uv run ruff check ., uv run pytest, node --check jev_ultrafast/static/app.js, uv build.
+Live smokes (no model calls): scripts/check_guards.py, scripts/check_containers.py, scripts/check_vscode.py.

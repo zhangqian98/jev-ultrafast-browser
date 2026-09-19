@@ -24,7 +24,7 @@ Every observation produces a new element table:
 ...
 ```
 
-The operations are `CLICK`, `TYPE_TEXT`, `SELECT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, and `BLOCKED`. Only supported operations and targets are offered.
+The operations are `CLICK`, `TYPE_TEXT`, `SELECT`, `SCROLL_UP`, `SCROLL_DOWN`, `PRESS_KEY`, `WAIT`, `DONE`, and `BLOCKED`. Only supported operations and targets are offered.
 
 ```text
                       one TypeSafe request
@@ -87,6 +87,17 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+## Drive VS Code
+
+The same agent can drive VS Code instead of a web page. For desktop VS Code, the MCP server (run: `uv run --project <repo> --with mcp python mcp_server.py`) exposes `vscode_start(goal, workspace, port)`: it launches Code.exe with a separate `jev-vscode-profile` user-data-dir and `--remote-debugging-port` (plus flags disabling background/occluded-window animation throttling, without which menus stall at opacity 0), seeds the profile's `User/settings.json` once for a clean Welcome state on every launch, attaches to the workbench page over CDP, and `browser_stop` detaches — VS Code keeps running. The library form is:
+
+```python
+with Agent(None, goal, cdp_url="http://127.0.0.1:9333", attach="workbench.html") as agent:
+    ...
+```
+
+For VS Code Web, use `browser_start("https://vscode.dev", goal)` (or `Agent("https://vscode.dev", goal)`).
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
@@ -97,6 +108,7 @@ uv run --env-file .env python examples/run.py \
 - **Keep hidden tabs rendering.** Focus emulation prevents background animation throttling without switching Chrome's visible tab.
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
+- **Keyboard and nested scrolling stay in the same loop.** `PRESS_KEY` drives menus and quick pickers on the focused control, and scroll actions can target a named inner container instead of the page.
 
 Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
 
@@ -110,6 +122,7 @@ Every executed target is resolved from an observed node. The executor rechecks p
 | [model.py](jev_ultrafast/model.py) | Dynamic operation/target heads and text generation |
 | [questions.py](jev_ultrafast/questions.py) | Model instructions |
 | [demo.py](jev_ultrafast/demo.py) | Local inspector |
+| [mcp_server.py](mcp_server.py) | MCP tools: browser sessions, text handoff, `vscode_start` |
 
 ## Evidence and limits
 
@@ -119,7 +132,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this MVP. Owned tabs share the existing Chrome profile.
+A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, and pop-up tabs remain outside this MVP. Nested scrolling covers up to three visible containers; keyboard support is the eight keys in PRESS_KEY (no modifiers). Owned tabs share the existing Chrome profile.
 
 ## Development
 
@@ -131,7 +144,7 @@ node --check jev_ultrafast/snapshot.js
 uv build
 ```
 
-Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
+Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls; `scripts/check_containers.py` covers nested scroll containers and key actions, and `scripts/check_vscode.py` covers the VS Code attach path (needs Code.exe on CDP :9333). Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
 
 ---
 
