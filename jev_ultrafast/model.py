@@ -7,6 +7,8 @@ import time
 
 import httpx
 
+from .compaction import compact_actions
+from .config import load_runtime_config
 from .questions import DONE_JUDGMENT, NEXT_ACTION, RISK_JUDGMENT, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -34,17 +36,38 @@ def noul_value(answer):
     return number
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def remaining():
+        if deadline is None:
+            return None
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("Model call deadline exceeded; no action executed.")
+        return value
+
+    def retry_delay(seconds):
+        left = remaining()
+        if left is not None and left <= seconds:
+            raise TimeoutError("Model call deadline exceeded; no action executed.")
+        time.sleep(seconds)
+
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            request_timeout = remaining()
+            kwargs = {"json": body, "headers": {"Authorization": f"Bearer {key}"}}
+            if request_timeout is not None:
+                kwargs["timeout"] = max(0.001, request_timeout)
+            response = CLIENT.post(url, **kwargs)
         except httpx.HTTPError:
             if attempt < 2:
-                time.sleep(0.5 * 2**attempt)
+                retry_delay(0.5 * 2**attempt)
                 continue
             raise RuntimeError("Model connection failed; no action executed.") from None
+        remaining()
         if response.status_code in {429, 529, 503} and attempt < 2:
-            time.sleep(0.5 * 2**attempt)
+            retry_delay(0.5 * 2**attempt)
             continue
         if response.is_error:
             raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
@@ -87,7 +110,14 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = {
+                k: action[k]
+                for k in (
+                    "role", "value", "checked", "selected", "expanded", "required",
+                    "href", "form_action", "modal", "focused",
+                )
+                if k in action
+            }
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -110,8 +140,30 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
-    elements, targets, controls = action_space(state["actions"])
+def element_nodes(actions):
+    """Map public element indices to the observed DOM node IDs behind them."""
+    nodes = []
+    seen = set()
+    for action in actions:
+        if action.get("kind") not in {"click", "fill", "file", "select"}:
+            continue
+        node = action.get("node")
+        if node in seen:
+            continue
+        seen.add(node)
+        nodes.append(node)
+    return {str(index): node for index, node in enumerate(nodes, start=1)}
+
+
+def choose(state, goal, history, *, timeout=None, candidate_limits=None):
+    limits = candidate_limits or load_runtime_config().candidates
+    compacted, candidate_stats = compact_actions(
+        state["actions"], goal, history, focus=state.get("focus"),
+        max_elements=limits.elements,
+        max_actions=limits.actions,
+        max_options_per_select=limits.options_per_select,
+    )
+    elements, targets, controls = action_space(compacted)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "RIGHT_CLICK": "Right-click an element to open its context menu.",
@@ -147,7 +199,14 @@ def choose(state, goal, history):
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+                    **{
+                        k: a[k]
+                        for k in (
+                            "role", "checked", "selected", "expanded", "required",
+                            "href", "form_action", "modal", "focused",
+                        )
+                        if k in a
+                    },
                 }
                 for index, a in candidates.items()
             }
@@ -172,6 +231,12 @@ def choose(state, goal, history):
     offscreen = state.get("offscreen") or {}
     if offscreen.get("above") or offscreen.get("below"):
         page["offscreen"] = offscreen
+    for key in ("selected_controls", "focus", "alerts"):
+        if state.get(key):
+            page[key] = state[key]
+    if state.get("omitted_actions"):
+        page["omitted_actions"] = state["omitted_actions"]
+    page["candidate_stats"] = candidate_stats
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -184,7 +249,13 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    post_options = {"timeout": timeout} if timeout is not None else {}
+    result = post_json(
+        "https://api.typesafe.ai/v1/systemone",
+        os.environ["TYPESAFE_API_KEY"],
+        body,
+        **post_options,
+    )
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -234,19 +305,29 @@ def choose(state, goal, history):
         "cost_usd": input_cost_usd(usage),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
+        "candidate_stats": candidate_stats,
+        "candidate_nodes": element_nodes(compacted),
     }
 
 
 def field_context(goal, action, page, history):
-    return {
+    context = {
         "goal": goal,
         "field": {k: action.get(k) for k in ("label", "role", "value")},
-        "page": {"title": page["title"], "text": page["text"][:6000]},
+        "page": {
+            "document_id": page.get("document_id") or [page.get("url")],
+            "title": page["title"],
+            "text": page["text"][:6000],
+        },
         "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
     }
+    for key in ("selected_controls", "focus", "alerts"):
+        if page.get(key):
+            context["page"][key] = page[key]
+    return context
 
 
-def field_texts(contexts):
+def field_texts(contexts, *, timeout=None):
     """One text-helper call for one or more field contexts (contexts[0] is the chosen field).
 
     Returns (values, helper); values[i] is a non-empty string or None. values[0] is
@@ -271,6 +352,7 @@ def field_texts(contexts):
             "fields": [{"index": i, **c["field"]} for i, c in enumerate(contexts)],
         }
     started = time.perf_counter()
+    post_options = {"timeout": timeout} if timeout is not None else {}
     result = post_json(
         base + "/chat/completions",
         key,
@@ -287,6 +369,7 @@ def field_texts(contexts):
                 },
             ],
         },
+        **post_options,
     )
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
@@ -310,6 +393,6 @@ def field_texts(contexts):
     }
 
 
-def field_text(context):
-    value, helper = field_texts([context])
+def field_text(context, *, timeout=None):
+    value, helper = field_texts([context], timeout=timeout)
     return value[0], helper

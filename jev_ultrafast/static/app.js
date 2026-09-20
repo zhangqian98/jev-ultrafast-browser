@@ -31,13 +31,15 @@ async function call(name, body = {}) {
   return data;
 }
 function controls() {
-  const live = state?.page && !["done", "blocked"].includes(state.status);
+  const stopped = ["done", "blocked"].includes(state?.status);
+  const held = ["confirm", "escalate"].includes(state?.status);
+  const observable = Boolean(state?.page) && !stopped;
   $("start").disabled = busy;
   $("scenario").disabled = busy;
   $("goal").disabled = busy;
-  $("choose").disabled = busy || !live;
-  $("execute").disabled = busy || !state?.decision || !live;
-  $("auto").disabled = busy || !live;
+  $("choose").disabled = busy || !observable;
+  $("execute").disabled = busy || !state?.decision || !observable || held;
+  $("auto").disabled = busy || !observable || held;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
   $("download").disabled = !state?.history?.length;
@@ -85,6 +87,8 @@ function render() {
     predicted: "Choice ready · inspect or execute",
     done: "Jev reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
+    confirm: "Paused · review the held action",
+    escalate: "Paused · decision needs review",
   };
   $("status").textContent = labels[state.status] || state.status;
   if (!page) {
@@ -117,10 +121,15 @@ function render() {
     const p = probability(e);
     return `<div class="choice ${selectedIndex === e.index ? 'best' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${p >= 0 ? percent(p) : '—'}</span></div>`;
   }).join('');
+  const candidateIndex = new Map(
+    Object.entries(state.element_nodes || {}).map(([index, node]) => [String(node), index]),
+  );
   const targets = new Map();
-  for (const a of page.actions) if (a.rect && !targets.has(a.node)) targets.set(a.node, a);
-  $("targets").innerHTML = [...targets.values()].map((a,i) => {
-    const index=String(i+1);
+  for (const a of page.actions) {
+    const index = candidateIndex.get(String(a.node));
+    if (index && a.rect && !targets.has(index)) targets.set(index, a);
+  }
+  $("targets").innerHTML = [...targets.entries()].map(([index,a]) => {
     return `<div class="target ${index === selectedIndex ? 'selected' : ''}" data-action="${index}" style="left:${100*a.rect.x/page.w}%;top:${100*a.rect.y/page.h}%;width:${100*a.rect.w/page.w}%;height:${100*a.rect.h/page.h}%"><span>${index}</span></div>`;
   }).join('');
   $("targets").hidden = !$("overlays").checked;
@@ -128,21 +137,26 @@ function render() {
     ? state.history
         .map(
           (h) =>
-            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.latency_ms} ms · ${percent(h.probability)}</span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
+            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text_supplied ? ` <b>Text supplied</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.latency_ms} ms · ${percent(h.probability)}</span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
         )
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';
   $("step-count").textContent = `${state.history.length} actions · ${(state.elapsed_ms / 1000).toFixed(2)} s`;
-  $("model-state").textContent = JSON.stringify(
-    d?.request || {
-      goal: state.goal,
+  $("model-state").textContent = JSON.stringify({
+    goal: state.goal,
+    page: {
       url: page.url,
+      title: page.title,
       text: page.text,
-      actions: page.actions.map(({ rect, node, ...rest }) => rest),
+      offscreen: page.offscreen,
+      selected_controls: page.selected_controls,
+      focus: page.focus,
+      alerts: page.alerts,
     },
-    null,
-    2,
-  );
+    elements: state.elements,
+    recent_actions: state.history.slice(-10),
+    candidate_stats: state.candidate_stats,
+  }, null, 2);
   controls();
 }
 $("task-form").addEventListener("submit", (event) => {
@@ -180,7 +194,7 @@ $("auto").addEventListener("click", () =>
       } else {
         await call("tick");
       }
-      if (["done", "blocked"].includes(state.status)) break;
+      if (["done", "blocked", "confirm", "escalate"].includes(state.status)) break;
     }
     automatic = false;
   }, "Running the browser…"),
@@ -215,11 +229,51 @@ $("choices").addEventListener("pointerleave", () =>
     ),
 );
 $("download").addEventListener("click", () => {
-  const { page, ...rest } = state;
+  const page = state.page || {};
+  const rest = { ...state };
+  delete rest.page;
+  delete rest.goal;
+  delete rest.plan;
+  delete rest.verify;
+  delete rest.elements;
+  rest.goal_chars = state.goal?.length || 0;
+  let safeUrl = "";
+  try {
+    const parsed = new URL(page.url);
+    safeUrl = ["http:", "https:"].includes(parsed.protocol)
+      ? `${parsed.origin}${parsed.pathname}`
+      : `${parsed.protocol}`;
+  } catch {
+    safeUrl = "";
+  }
+  const actions = (page.actions || []).map(({ value, current_value, ...action }) => ({
+    ...action,
+    value_supplied: Boolean(value),
+    current_value_supplied: Boolean(current_value),
+  }));
+  const selected_controls = (page.selected_controls || []).map(({ value, options, ...control }) => ({
+    ...control,
+    value_supplied: Boolean(value),
+    option_count: options?.length || 0,
+  }));
   const blob = new Blob(
     [
       JSON.stringify(
-        { ...rest, page: { ...page, screenshot: undefined } },
+        {
+          ...rest,
+          page: {
+            url: safeUrl,
+            title: page.title,
+            fingerprint: page.fingerprint,
+            scroll: page.scroll,
+            omitted_actions: page.omitted_actions,
+            offscreen: page.offscreen,
+            actions,
+            selected_controls,
+            focus: page.focus,
+            alert_count: page.alerts?.length || 0,
+          },
+        },
         null,
         2,
       ),

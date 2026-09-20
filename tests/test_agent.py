@@ -1,6 +1,7 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
 import json
+import threading
 import time
 from copy import deepcopy
 from unittest.mock import Mock
@@ -9,7 +10,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
-from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.browser import ActionMayHaveApplied, StalePage, browser_operation, fingerprint
 
 
 def page():
@@ -96,6 +97,7 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
+    assert d["candidate_nodes"] == {"1": 10, "2": 20}
     assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target",
                                          "drag_source", "drag_target", "done", "risk"}
 
@@ -223,7 +225,11 @@ def runner():
     a.text_cache = {}
     p = page()
     a.state = {
-        "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
+        "browser": Mock(
+            fresh=Mock(return_value=True),
+            observe=Mock(return_value=p),
+            consume_security_block=Mock(return_value=None),
+        ),
         "page": p,
         "decision": decision(),
         "goal": "Find a book",
@@ -446,6 +452,17 @@ def test_changed_field_context_does_not_reuse_generated_text(runner, monkeypatch
     assert helper.call_count == 2
 
 
+def test_field_context_binds_generated_text_to_the_observed_document():
+    first = page()
+    second = deepcopy(first)
+    first["url"] = "https://one.test/form"
+    second["url"] = "https://two.test/form"
+    action = first["actions"][0]
+    assert model.field_context("Enter Ada", action, first, []) != model.field_context(
+        "Enter Ada", action, second, []
+    )
+
+
 def test_batch_field_text_parses_all_fields(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     post = Mock(return_value={"choices": [{"message": {"content":
@@ -484,6 +501,38 @@ def test_batch_text_generation_fills_other_fields_from_one_call(runner, monkeypa
     assert runner.state["text_calls"][-1]["model"] == "cached"
 
 
+def test_speculative_text_batch_is_bounded_and_respects_candidate_nodes(runner, monkeypatch):
+    p = runner.state["page"]
+    for index in range(30):
+        p["actions"].append({
+            "id": f"extra-{index}",
+            "kind": "fill",
+            "label": f"Extra {index}",
+            "role": "textbox",
+            "value": "",
+            "node": 100 + index,
+        })
+    p["fingerprint"] = fingerprint(p)
+    runner.state["decision"]["candidate_nodes"] = {
+        "1": 10,
+        **{str(index + 2): 100 + index for index in range(20)},
+    }
+    seen = {}
+
+    def helper(contexts):
+        seen["labels"] = [context["field"]["label"] for context in contexts]
+        return (["chosen", *[f"value-{index}" for index in range(len(contexts) - 1)]],
+                {"model": "test", "latency_ms": 1})
+
+    monkeypatch.setattr(loop, "field_texts", helper)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+
+    assert seen["labels"][0] == "Search"
+    assert len(seen["labels"]) == 16
+    assert all(label == "Search" or label.startswith("Extra ") for label in seen["labels"])
+    assert "Extra 20" not in seen["labels"]
+
+
 def test_loading_waits_do_not_trigger_no_progress_stop(runner):
     for _ in range(5):
         runner.state["decision"] = decision("wait")
@@ -498,6 +547,30 @@ def test_stale_observation_preserves_executed_action(runner):
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["history"][-1]["action"] == "Go"
     runner.state["browser"].act.assert_called_once()
+
+
+def test_tick_recovers_post_action_stale_without_replaying_mutation(runner, monkeypatch):
+    fresh = page()
+    fresh["text"] = "Search results"
+    fresh["fingerprint"] = fingerprint(fresh)
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    runner.state["browser"].observe.side_effect = [StalePage("post-action read changed"), fresh]
+    monkeypatch.setattr(loop, "choose", Mock(return_value={
+        **decision("e3"),
+        "operation": "CLICK",
+        "target": "2",
+        "operation_probabilities": {"CLICK": 1.0},
+        "target_probabilities": {"2": 1.0},
+        "candidate_stats": {"omitted": 0},
+    }))
+
+    snap = runner.command("tick")
+    assert snap["status"] == "ready"
+    assert runner.state["browser"].act.call_count == 1
+    assert len(runner.state["history"]) == 1
+    assert runner.state["history"][-1]["page_changed"] is True
+    assert runner.state["history"][-1]["url"] == fresh["url"]
 
 
 def test_observation_is_one_atomic_browser_read(monkeypatch):
@@ -546,6 +619,20 @@ def test_fingerprint_tracks_values_and_identity_not_screenshots():
     other["screenshot"] = "changed"
     assert fingerprint(p) == fingerprint(other)
     other["actions"][0]["node"] = 99
+    assert fingerprint(p) != fingerprint(other)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("title", "Changed title"),
+    ("offscreen", {"above": [], "below": ["Checkout"]}),
+    ("selected_controls", [{"node": 7, "role": "radio", "label": "One way", "checked": True}]),
+    ("focus", {"node": 10, "role": "textbox", "label": "Search"}),
+    ("alerts", [{"role": "status", "text": "Loaded"}]),
+])
+def test_fingerprint_tracks_structured_policy_state(key, value):
+    p = page()
+    other = deepcopy(p)
+    other[key] = value
     assert fingerprint(p) != fingerprint(other)
 
 
@@ -690,6 +777,27 @@ def test_dropped_wheel_is_dispatched_again():
     assert sent.count("Input.dispatchMouseEvent") == 4  # two hover+wheel attempts
 
 
+def test_scroll_that_loses_its_document_after_dispatch_is_not_retryable():
+    sent = []
+    reads = 0
+
+    def send(method, session_id=None, **params):
+        nonlocal reads
+        sent.append(method)
+        if method == "Runtime.evaluate":
+            reads += 1
+            if reads == 1:
+                return {"result": {"value": "0,0"}}
+            raise StalePage("document changed")
+        return {}
+
+    with pytest.raises(ActionMayHaveApplied, match="Scroll input was dispatched"):
+        browser_operation({"operation": "act", "session": "s", "cdp": send,
+                           "action": {"id": "scroll_down", "kind": "scroll",
+                                      "delta": 560, "label": "Scroll down"}})
+    assert "Input.dispatchMouseEvent" in sent
+
+
 def test_scroll_in_gone_container_is_stale():
     cdp = Mock(return_value={"result": {"value": None}})
     with pytest.raises(StalePage, match="Scroll container"):
@@ -765,6 +873,20 @@ def test_wait_executes_on_a_changed_page():
     assert b.act({"id": "wait", "kind": "wait"}, {"marker": 1}) == {"executed": "wait"}
     with pytest.raises(StalePage):
         b.act({"id": "e1", "kind": "click", "node": 1}, {"marker": 1})
+
+
+def test_key_freshness_tracks_focus_without_invalidating_general_page_freshness():
+    from jev_ultrafast.browser import Browser
+
+    b = Browser.__new__(Browser)
+    focus = [1, "textbox", "Search", "true", None]
+    b.evaluate = Mock(side_effect=[["page-marker", focus], "page-marker"])
+    page_state = {
+        "focus_guard": focus,
+        "marker": "page-marker",
+    }
+    assert b.fresh(page_state, {"kind": "key", "key": "Enter"})
+    assert b.fresh(page_state)
 
 
 def test_direct_cdp_roundtrip_events_and_errors():
@@ -921,6 +1043,20 @@ def test_origin_allowlist():
     assert origin_allowed("https://anything.test/", [])
 
 
+def test_post_click_security_block_is_recorded_as_executed_then_held(runner):
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    runner.state["browser"].consume_security_block.return_value = {
+        "type": "security",
+        "url": "https://outside.test/",
+    }
+    snap = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert snap["status"] == "confirm"
+    assert snap["gate"]["verdict"] == "confirm"
+    assert len(runner.state["history"]) == 1
+    runner.state["browser"].act.assert_called_once()
+    runner.state["browser"].observe.assert_called_once()
+
+
 def test_direct_cdp_captures_diagnostic_logs():
     from jev_ultrafast.browser import DirectCDP
     conn = DirectCDP.__new__(DirectCDP)
@@ -966,6 +1102,33 @@ def test_offscreen_controls_reach_the_model_state(monkeypatch):
     assert "offscreen" not in seen  # empty lists are not sent
 
 
+def test_structured_selected_focus_and_alert_state_reaches_model(monkeypatch):
+    p = page()
+    p["selected_controls"] = [
+        {"node": 30, "role": "radio", "label": "One way", "checked": True}
+    ]
+    p["focus"] = {"node": 10, "role": "textbox", "label": "Search", "expanded": "true"}
+    p["alerts"] = [{"role": "status", "text": "3 results loaded"}]
+    seen = {}
+
+    def post(_url, _key, body):
+        seen.update(body["state"]["page"])
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(["1", "2"], "2"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(p, "Open results", [])
+    assert seen["selected_controls"][0]["label"] == "One way"
+    assert seen["focus"]["label"] == "Search"
+    assert seen["alerts"][0]["text"] == "3 results loaded"
+
+
 def test_review_is_an_offered_operation(monkeypatch):
     def post(_url, _key, body):
         assert "REVIEW" in body["questions"]["operation"]["criteria"]
@@ -980,3 +1143,167 @@ def test_review_is_an_offered_operation(monkeypatch):
     monkeypatch.setattr(model, "post_json", post)
     d = model.choose(page(), "Delete everything", [])
     assert d["operation"] == "REVIEW" and d["choice"] == "REVIEW"
+
+
+@pytest.mark.parametrize(("operation", "selected"), [("DONE", "DONE"), ("CLICK", "e3")])
+def test_terminal_choice_from_truncated_candidates_is_held(runner, monkeypatch, operation, selected):
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    monkeypatch.setattr(loop, "choose", Mock(return_value={
+        "choice": selected,
+        "operation": operation,
+        "target": None if operation == "DONE" else "2",
+        "confidence": 1.0,
+        "target_confidence": None,
+        "probabilities": {selected: 1.0},
+        "operation_probabilities": {operation: 1.0},
+        "target_probabilities": {},
+        "done_p": 0.99,
+        "risk_p": 0.0,
+        "latency_ms": 1,
+        "usage": {},
+        "candidate_stats": {"omitted": 1},
+    }))
+    snap = runner.command("predict")
+    assert snap["decision"]["gate"]["verdict"] == "escalate"
+    assert "truncated" in snap["decision"]["gate"]["reasons"][0]
+
+
+def test_cancel_after_provider_response_never_publishes_an_ungated_decision(runner, monkeypatch):
+    cancel = threading.Event()
+    runner.cancel_event = cancel
+    runner.deadline_at = None
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+
+    def choose_then_cancel(*_args, **_kwargs):
+        cancel.set()
+        return {
+            **decision("e3"),
+            "operation": "CLICK",
+            "target": "2",
+            "operation_probabilities": {"CLICK": 1.0},
+            "target_probabilities": {"2": 1.0},
+            "candidate_stats": {"omitted": 0},
+        }
+
+    monkeypatch.setattr(loop, "choose", choose_then_cancel)
+    with pytest.raises(loop.AgentInterrupted, match="decision_result"):
+        runner.command("predict")
+    assert runner.state["decision"] is None
+
+
+@pytest.mark.parametrize("status", ["done", "blocked", "confirm", "escalate"])
+def test_tick_never_advances_a_terminal_or_held_run(runner, monkeypatch, status):
+    held = runner.state["decision"]
+    runner.state["status"] = status
+    choose = Mock(side_effect=AssertionError("terminal tick must not predict"))
+    monkeypatch.setattr(loop, "choose", choose)
+
+    snapshot = runner.command("tick")
+
+    assert snapshot["status"] == status
+    assert runner.state["decision"] is held
+    choose.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_pending_security_block_stops_before_verify_or_model_call(runner, monkeypatch):
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    runner.state["browser"].consume_security_block.return_value = {
+        "type": "security",
+        "url": "https://outside.test/path?token=secret#fragment",
+    }
+    choose = Mock(side_effect=AssertionError("blocked navigation must stop before the model"))
+    monkeypatch.setattr(loop, "choose", choose)
+
+    snapshot = runner.command("predict")
+
+    assert snapshot["status"] == "confirm"
+    assert snapshot["decision"] is None
+    reason = snapshot["gate"]["reasons"][0]
+    assert reason.endswith("https://outside.test/path")
+    assert "secret" not in reason and "fragment" not in reason
+    choose.assert_not_called()
+
+
+def test_reobserved_disallowed_origin_stops_before_verify_or_model_call(runner, monkeypatch):
+    outside = deepcopy(runner.state["page"])
+    outside["url"] = "https://outside.test/path?token=secret"
+    outside["fingerprint"] = fingerprint(outside)
+    runner.state.update(
+        status="ready",
+        decision=None,
+        allowed_origins=["https://*.example.test"],
+        verify={"text": "Search"},
+    )
+    runner.state["browser"].fresh.return_value = False
+    runner.state["browser"].observe.return_value = outside
+    choose = Mock(side_effect=AssertionError("outside-origin state must not reach the model"))
+    monkeypatch.setattr(loop, "choose", choose)
+
+    snapshot = runner.command("predict")
+
+    assert snapshot["status"] == "confirm"
+    assert "outside.test/path" in snapshot["gate"]["reasons"][0]
+    assert snapshot.get("verified") is not True
+    choose.assert_not_called()
+
+
+def test_action_result_unknown_is_not_classified_as_pre_input_stale(runner):
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    runner.state["browser"].act.side_effect = ActionMayHaveApplied("input dispatched")
+
+    with pytest.raises(ActionMayHaveApplied):
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+
+    assert runner.state["decision"] is None
+    assert runner.state["status"] == "escalate"
+    assert runner.state.get("stale", 0) == 0
+
+
+def test_policy_failure_never_publishes_the_raw_model_decision(runner, monkeypatch):
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    predicted = {
+        **decision("e3"),
+        "operation": "CLICK",
+        "target": "2",
+        "operation_probabilities": {"CLICK": 1.0},
+        "target_probabilities": {"2": 1.0},
+        "candidate_stats": {"omitted": 0},
+    }
+    monkeypatch.setattr(loop, "choose", Mock(return_value=predicted))
+    monkeypatch.setattr(loop, "evaluate_policy", Mock(side_effect=RuntimeError("policy failed")))
+
+    with pytest.raises(RuntimeError, match="policy failed"):
+        runner.command("predict")
+
+    assert runner.state["decision"] is None
+    assert runner.state["decisions"] == []
+
+
+def test_agent_passes_the_remaining_deadline_to_the_model(runner, monkeypatch):
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    runner.deadline_at = time.monotonic() + 5
+    seen = {}
+
+    def choose_with_timeout(_page, _goal, _history, *, timeout, candidate_limits):
+        seen["timeout"] = timeout
+        seen["candidate_limits"] = candidate_limits
+        return {
+            **decision("e3"),
+            "operation": "CLICK",
+            "target": "2",
+            "operation_probabilities": {"CLICK": 1.0},
+            "target_probabilities": {"2": 1.0},
+            "candidate_stats": {"omitted": 0},
+        }
+
+    monkeypatch.setattr(loop, "choose", choose_with_timeout)
+    runner.command("predict")
+
+    assert 0 < seen["timeout"] <= 5
+    assert seen["candidate_limits"].elements > 0

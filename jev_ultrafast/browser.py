@@ -6,14 +6,22 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urljoin
 
 import websockets.sync.client
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
+from .trace import safe_url
+
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+KEY_MARKER = (
+    f"(() => {{ const state={READ_STATE}; "
+    "return state ? [state.marker,state.focus_guard] : null; })()"
+)
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 KEYS = {"Enter": 13, "Escape": 27, "Tab": 9, "Backspace": 8,
         "ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39}
@@ -41,13 +49,15 @@ class DirectCDP:
 
     def __init__(self, base_url, timeout=30):
         info = json.loads(
-            urllib.request.urlopen(base_url.rstrip("/") + "/json/version", timeout=5).read())
+            _LOCAL_OPENER.open(base_url.rstrip("/") + "/json/version", timeout=5).read())
         self.ws = websockets.sync.client.connect(
             info["webSocketDebuggerUrl"], max_size=None, open_timeout=timeout)
         self.timeout, self.next_id = timeout, 0
         self.events = []
         self.dialog_accept = {"accept": False}
         self.logs, self._log_id = [], 0
+        self.security_blocks = {}
+        self.allowed_origins, self.main_frames = {}, {}
 
     @classmethod
     def from_ws_url(cls, url, timeout=30):
@@ -57,7 +67,26 @@ class DirectCDP:
         cdp_.events = []
         cdp_.dialog_accept = {"accept": False}
         cdp_.logs, cdp_._log_id = [], 0
+        cdp_.security_blocks = {}
+        cdp_.allowed_origins, cdp_.main_frames = {}, {}
         return cdp_
+
+    def _append_log(self, kind, level, text, url=None, session_id=None):
+        self._log_id += 1
+        entry = {"id": self._log_id, "ts": round(time.time(), 3),
+                 "type": kind, "level": level,
+                 "text": str(text).strip()[:500], "url": url}
+        self.logs.append(entry)
+        if kind == "security":
+            # Security decisions must not disappear when noisy pages overflow
+            # the general diagnostic ring. One pending latch per CDP session is
+            # sufficient because any block pauses the agent for review.
+            blocks = getattr(self, "security_blocks", None)
+            if blocks is None:
+                blocks = self.security_blocks = {}
+            blocks[session_id] = entry
+        if len(self.logs) > 1000:
+            del self.logs[: len(self.logs) - 1000]
 
     def _capture_log(self, method, params):
         """Translate CDP events into a bounded diagnostic log ring."""
@@ -90,34 +119,67 @@ class DirectCDP:
             text = params.get("suggestedFilename") or params.get("url", "download attempt")
         if kind is None:
             return
-        self._log_id += 1
-        self.logs.append({"id": self._log_id, "ts": round(time.time(), 3),
-                          "type": kind, "level": level,
-                          "text": str(text).strip()[:500], "url": url})
-        if len(self.logs) > 1000:
-            del self.logs[: len(self.logs) - 1000]
+        self._append_log(kind, level, text, url)
 
-    def __call__(self, method, session_id=None, _response_timeout=None, **params):
+    def _send_aux(self, method, params, session_id=None):
         self.next_id += 1
         msg = {"id": self.next_id, "method": method, "params": params}
         if session_id:
             msg["sessionId"] = session_id
         self.ws.send(json.dumps(msg))
+
+    def __call__(self, method, session_id=None, _response_timeout=None, **params):
+        self.next_id += 1
+        request_id = self.next_id
+        msg = {"id": request_id, "method": method, "params": params}
+        if session_id:
+            msg["sessionId"] = session_id
+        self.ws.send(json.dumps(msg))
         deadline = time.monotonic() + (_response_timeout or self.timeout)
         while True:
-            reply = json.loads(self.ws.recv(timeout=max(0.01, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"CDP {method} timed out")
+            reply = json.loads(self.ws.recv(timeout=remaining))
             if reply.get("method") == "Page.javascriptDialogOpening":
                 # A modal dialog blocks all evaluation; dismiss it in-band so calls unblock.
-                self.next_id += 1
-                dismiss = {"id": self.next_id, "method": "Page.handleJavaScriptDialog",
-                           "params": dict(self.dialog_accept)}
-                if reply.get("sessionId"):
-                    dismiss["sessionId"] = reply["sessionId"]
                 self.events.append(reply)
                 self._capture_log(reply["method"], reply.get("params") or {})
-                self.ws.send(json.dumps(dismiss))
+                self._send_aux("Page.handleJavaScriptDialog", dict(self.dialog_accept),
+                               reply.get("sessionId"))
                 continue
-            if reply.get("id") != self.next_id:
+            if reply.get("method") == "Fetch.requestPaused":
+                event = reply.get("params") or {}
+                event_session = reply.get("sessionId")
+                request = event.get("request") or {}
+                url = request.get("url", "")
+                patterns = self.allowed_origins.get(event_session)
+                main_frame = self.main_frames.get(event_session)
+                blocked = False
+                if patterns and main_frame and event.get("frameId") == main_frame:
+                    from .policy import origin_allowed
+
+                    blocked = not origin_allowed(url, patterns)
+                if blocked:
+                    self._append_log("security", "blocked",
+                                     "Blocked navigation outside allowed origins", url,
+                                     event_session)
+                    self._send_aux("Fetch.failRequest",
+                                   {"requestId": event["requestId"],
+                                    "errorReason": "BlockedByClient"}, event_session)
+                else:
+                    self._send_aux("Fetch.continueRequest",
+                                   {"requestId": event["requestId"]}, event_session)
+                continue
+            if "method" in reply:
+                if reply["method"] == "Page.frameNavigated":
+                    frame = (reply.get("params") or {}).get("frame") or {}
+                    if not frame.get("parentId") and frame.get("id"):
+                        self.main_frames[reply.get("sessionId")] = frame["id"]
+                self.events.append(reply)
+                self._capture_log(reply["method"], reply.get("params") or {})
+                continue
+            if reply.get("id") != request_id:
                 if "method" in reply:
                     self.events.append(reply)
                     self._capture_log(reply["method"], reply.get("params") or {})
@@ -153,6 +215,18 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class ActionMayHaveApplied(RuntimeError):
+    """Input was dispatched, but its result could not be observed safely."""
+
+
+class NavigationBlocked(ValueError):
+    """A known action destination falls outside the caller's origin allowlist."""
+
+    def __init__(self, url):
+        self.url = str(url or "")
+        super().__init__(f"navigation outside allowed origins blocked: {safe_url(self.url)}")
+
+
 class Browser:
     def __init__(self, url=None, *, cdp_url=None, attach=None):
         if (url is None) == (attach is None):
@@ -167,6 +241,8 @@ class Browser:
         self._owned_targets = set()
         self._known_targets = set()
         self.dialogs = []
+        self.allowed_origins = None
+        self.timeout_provider = None
         if attach is not None:
             self.owned = False
             targets = self.cdp("Target.getTargets").get("targetInfos", [])
@@ -200,22 +276,47 @@ class Browser:
             except RuntimeError:
                 pass
         self.follow = self.owned  # only dedicated automation browsers get new tabs
-        self._known_targets = {t["targetId"] for t in self._pages()}
+        self._known_targets = {t["targetId"] for t in self._all_pages()}
         self._settle()
 
-    def _pages(self):
+    def _send(self, method, session_id=None, **params):
+        if "_response_timeout" not in params:
+            provider = getattr(self, "timeout_provider", None)
+            remaining = provider() if callable(provider) else None
+            if remaining is not None:
+                params["_response_timeout"] = max(0.001, remaining)
+        return self.cdp(method, session_id=session_id, **params)
+
+    def _all_pages(self):
+        provider = getattr(self, "timeout_provider", None)
+        if callable(provider):
+            provider()  # propagate cancellation/deadline before the fallback path below
         try:
-            return [t for t in self.cdp("Target.getTargets").get("targetInfos", [])
+            return [t for t in self._send("Target.getTargets").get("targetInfos", [])
                     if t.get("type") == "page"]
+        except TimeoutError:
+            raise
         except Exception:
             return []
 
+    def _pages(self):
+        pages = self._all_pages()
+        allowed = self._owned_targets if getattr(self, "owned", False) else {self.target}
+        return [page for page in pages if page.get("targetId") in allowed]
+
     def switch_to(self, target_id):
-        session = self.cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+        allowed = self._owned_targets if getattr(self, "owned", False) else {self.target}
+        if target_id not in allowed:
+            raise ValueError("Target is not owned by this browser session")
+        old_session = self.session
+        session = self._send("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
         try:
-            self.cdp("Target.detachFromTarget", sessionId=self.session)
+            self._send("Target.detachFromTarget", session_id=None, sessionId=self.session)
         except RuntimeError:
             pass
+        if isinstance(self.cdp, DirectCDP):
+            self.cdp.allowed_origins.pop(old_session, None)
+            self.cdp.main_frames.pop(old_session, None)
         self.target, self.session = target_id, session
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         for domain in ("Page.enable", "Runtime.enable", "Log.enable", "Network.enable"):
@@ -223,18 +324,19 @@ class Browser:
                 self.call(domain)
             except RuntimeError:
                 pass
+        if getattr(self, "allowed_origins", None):
+            self.set_allowed_origins(self.allowed_origins)
 
     def _maybe_retarget(self):
         """Follow tabs the page opened (window.open, target=_blank, ctrl+click)."""
         if not self.follow or not self.target:
             return
-        pages = self._pages()
+        pages = self._all_pages()
         fresh = [t for t in pages if t["targetId"] not in self._known_targets]
         self._known_targets = {t["targetId"] for t in pages}
-        if fresh:
-            opened = next((t for t in fresh if t.get("openerId") == self.target), fresh[-1])
-            if self.owned:
-                self._owned_targets.add(opened["targetId"])
+        opened = next((t for t in fresh if t.get("openerId") == self.target), None)
+        if opened:
+            self._owned_targets.add(opened["targetId"])
             self.switch_to(opened["targetId"])
 
     def _settle(self):
@@ -256,12 +358,38 @@ class Browser:
             time.sleep(0.25)
 
     def call(self, method, **params):
-        return self.cdp(method, session_id=self.session, **params)
+        return self._send(method, session_id=self.session, **params)
+
+    def set_allowed_origins(self, patterns):
+        self.allowed_origins = tuple(patterns or ())
+        if not isinstance(self.cdp, DirectCDP):
+            return
+        if self.allowed_origins:
+            tree = self.call("Page.getFrameTree").get("frameTree", {})
+            frame_id = (tree.get("frame") or {}).get("id")
+            if frame_id:
+                self.cdp.main_frames[self.session] = frame_id
+            self.cdp.allowed_origins[self.session] = self.allowed_origins
+            self.call("Fetch.enable", patterns=[{
+                "urlPattern": "*",
+                "resourceType": "Document",
+                "requestStage": "Request",
+            }])
+        else:
+            self.cdp.allowed_origins.pop(self.session, None)
+            self.cdp.main_frames.pop(self.session, None)
+            try:
+                self.call("Fetch.disable")
+            except RuntimeError:
+                pass
 
     def evaluate(self, expression):
         response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
         if response.get("exceptionDetails"):
-            raise StalePage("Document changed during evaluation")
+            details = response["exceptionDetails"]
+            description = str((details.get("exception") or {}).get("description", "")).splitlines()[0]
+            reason = description or details.get("text") or "evaluation failed"
+            raise StalePage(f"Document changed during evaluation: {reason[:300]}")
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
@@ -309,7 +437,7 @@ class Browser:
             try:
                 state = browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot,
-                     "cdp": self.cdp}
+                     "cdp": self._send}
                 )
                 if isinstance(self.cdp, DirectCDP):
                     fresh = [e["params"] for e in self.cdp.events
@@ -338,18 +466,46 @@ class Browser:
                 f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
+        if action is not None and action["kind"] == "key":
+            return self.evaluate(KEY_MARKER) == [page["marker"], page.get("focus_guard")]
         return self.evaluate(MARKER) == page["marker"]
 
     def act(self, action, page, text=None):
         # A wait targets nothing; a changed page is exactly what it waited for.
         if action["kind"] != "wait" and not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
+        destination = action.get("href") or action.get("form_action")
+        if destination and self.allowed_origins:
+            from .policy import origin_allowed
+
+            absolute = urljoin(page.get("url", ""), destination)
+            if not origin_allowed(absolute, self.allowed_origins):
+                raise NavigationBlocked(absolute)
         if action["kind"] == "wait":
             time.sleep(0.1)
         result = browser_operation({"operation": "act", "session": self.session, "action": action,
-                                    "text": text, "cdp": self.cdp})
+                                    "text": text, "cdp": self._send})
         self.after_input = action if action["kind"] != "wait" else None
         return result
+
+    def consume_security_block(self):
+        if not isinstance(self.cdp, DirectCDP):
+            return None
+        blocks = getattr(self.cdp, "security_blocks", {})
+        entry = blocks.pop(getattr(self, "session", None), None) or blocks.pop(None, None)
+        if entry is not None:
+            return entry
+        if not blocks:
+            return None
+        # A popup retarget detaches the opener session before the next policy
+        # checkpoint. Preserve a block emitted by that just-detached session;
+        # each Browser owns its DirectCDP connection, so these entries cannot
+        # belong to another agent session.
+        session_id, entry = min(
+            blocks.items(), key=lambda item: item[1].get("id", float("inf"))
+        )
+        blocks.pop(session_id, None)
+        return entry
 
     def logs(self, after_id=0, limit=200):
         entries = getattr(self.cdp, "logs", [])
@@ -360,25 +516,37 @@ class Browser:
     def close(self):
         if not self.target:
             return
+        self.timeout_provider = None
         target, session = self.target, self.session
         self.target = self.session = None
         if self.owned:
             for owned in self._owned_targets | {target}:
                 try:
-                    self.cdp("Target.closeTarget", targetId=owned)
+                    self._send("Target.closeTarget", targetId=owned)
                 except RuntimeError:
                     pass
         else:
             try:
-                self.cdp("Target.detachFromTarget", sessionId=session)
+                self._send("Target.detachFromTarget", sessionId=session)
             except RuntimeError:
                 pass
         if isinstance(self.cdp, DirectCDP):
+            self.cdp.allowed_origins.pop(session, None)
+            self.cdp.main_frames.pop(session, None)
             self.cdp.close()
 
 
 def fingerprint(state):
-    content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
+    # Hash every structured field the policy can observe.  This fingerprint is
+    # used for caller hand-off and progress detection, so changes to focus,
+    # selected controls, alerts, or offscreen controls must count even when the
+    # visible text and action rows happen to stay byte-identical.
+    keys = (
+        "url", "title", "text", "actions", "scroll", "offscreen",
+        "selected_controls", "selected_controls_truncated", "focus", "alerts", "omitted_actions",
+        "text_complete", "elements_complete", "cross_origin_frames", "document_id",
+    )
+    content = {key: state.get(key) for key in keys}
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
@@ -428,10 +596,21 @@ def browser_operation(request):
             for _attempt in range(2):
                 call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
                 time.sleep(0.05)
-                call("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y,
-                     deltaX=action.get("dx", 0), deltaY=action["delta"])
+                try:
+                    call("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y,
+                         deltaX=action.get("dx", 0), deltaY=action["delta"])
+                except (RuntimeError, TimeoutError) as error:
+                    raise ActionMayHaveApplied(
+                        "Scroll input was dispatched; inspect before continuing."
+                    ) from error
                 time.sleep(0.08)
-                if evaluate(pos_expr) != before:
+                try:
+                    changed = evaluate(pos_expr) != before
+                except (StalePage, RuntimeError, TimeoutError) as error:
+                    raise ActionMayHaveApplied(
+                        "Scroll input was dispatched before the page changed; inspect before continuing."
+                    ) from error
+                if changed:
                     break
         elif kind == "file":
             if type(action["node"]) is not int:

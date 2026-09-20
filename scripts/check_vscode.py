@@ -1,16 +1,18 @@
 """Attach to VS Code desktop over CDP and drive the workbench. No model calls."""
 
 import json
+import os
 import time
 import urllib.request
 
 from jev_ultrafast.browser import Browser, press_key
 
-CDP = "http://127.0.0.1:9333"
+CDP = os.environ.get("JEV_VSCODE_CDP_URL", "http://127.0.0.1:9333")
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def pages():
-    return json.loads(urllib.request.urlopen(f"{CDP}/json/list", timeout=2).read())
+    return json.loads(OPENER.open(f"{CDP}/json/list", timeout=2).read())
 
 
 def main():
