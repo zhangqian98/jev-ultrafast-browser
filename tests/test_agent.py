@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -407,14 +408,36 @@ def test_new_page_target_is_followed():
     assert any(m == "Target.detachFromTarget" for m, _p in calls)
 
 
-def test_press_key_sends_modifier_combinations():
+@pytest.mark.parametrize(("key", "expected"), [
+    ("Ctrl+Shift+P", (10, "P", "KeyP", 80)),
+    ("Ctrl+V", (2, "v", "KeyV", 86)),
+])
+def test_press_key_sends_modifier_combinations(key, expected):
     from jev_ultrafast.browser import press_key
     sent = []
-    press_key(lambda m, **p: sent.append((m, p)), "Ctrl+Shift+P")
+    press_key(lambda m, **p: sent.append((m, p)), key)
     events = [p for m, p in sent if m == "Input.dispatchKeyEvent"]
     assert [e["type"] for e in events] == ["rawKeyDown", "keyUp"]
-    assert all(e["modifiers"] == 10 and e["key"] == "P" and e["code"] == "KeyP"
-               for e in events)
+    modifiers, value, code, vk = expected
+    assert all(
+        e["modifiers"] == modifiers
+        and e["key"] == value
+        and e["code"] == code
+        and e["windowsVirtualKeyCode"] == vk
+        for e in events
+    )
+
+
+def test_vscode_snapshot_offers_every_supported_shortcut():
+    from jev_ultrafast.browser import COMBOS
+
+    source = (Path(__file__).resolve().parents[1] / "jev_ultrafast" / "snapshot.js").read_text(encoding="utf-8")
+    assert all(f"'{key}'" in source for key in COMBOS)
+
+
+def test_press_key_rejects_unknown_combinations():
+    from jev_ultrafast.browser import press_key
+
     with pytest.raises(ValueError, match="Unsupported key"):
         press_key(lambda m, **p: None, "Ctrl+Alt+Delete")
 

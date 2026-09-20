@@ -37,6 +37,7 @@ COMBOS = {
     "Ctrl+`": _combo("`", "Backquote", 192), "Ctrl+N": _combo("n", "KeyN", 78),
     "Ctrl+S": _combo("s", "KeyS", 83), "Ctrl+W": _combo("w", "KeyW", 87),
     "Ctrl+F": _combo("f", "KeyF", 70), "Ctrl+B": _combo("b", "KeyB", 66),
+    "Ctrl+V": _combo("v", "KeyV", 86),
     "Ctrl+Z": _combo("z", "KeyZ", 90), "Ctrl+Y": _combo("y", "KeyY", 89),
     "Ctrl+Shift+E": _combo("e", "KeyE", 69, True),
     "Ctrl+Shift+F": _combo("f", "KeyF", 70, True),

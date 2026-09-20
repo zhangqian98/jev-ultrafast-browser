@@ -260,7 +260,7 @@
     for (const key of ['Enter','Escape','Tab','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'])
       actions.push({id:'key_'+key.toLowerCase(),kind:'key',key,label:'Press '+key});
   if (location.href.includes('workbench.html'))
-    for (const key of ['Ctrl+P','Ctrl+Shift+P','Ctrl+`','Ctrl+N','Ctrl+S','Ctrl+W','Ctrl+F',
+    for (const key of ['Ctrl+P','Ctrl+Shift+P','Ctrl+`','Ctrl+N','Ctrl+S','Ctrl+W','Ctrl+F','Ctrl+V',
                        'Ctrl+Shift+E','Ctrl+Shift+F','Ctrl+Shift+X','Ctrl+B','Ctrl+Z','Ctrl+Y'])
       actions.push({id:'key_'+key.toLowerCase().replaceAll('+','_'),kind:'key',key,
         label:'Press '+key});

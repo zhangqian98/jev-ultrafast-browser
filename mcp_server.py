@@ -863,7 +863,7 @@ _KEY_ALIASES = {"left": "ArrowLeft", "right": "ArrowRight", "up": "ArrowUp", "do
 @mcp.tool()
 def browser_press_key(session_id: str, key: str,
                       timeout_ms: int = DEFAULT_STEP_TIMEOUT_MS) -> dict:
-    """Send one key press (left/right/up/down/enter/escape/tab/backspace) to the page.
+    """Send one key press or supported shortcut (including Ctrl+V paste) to the page.
 
     Needed for keyboard-driven controls such as sliders and open menus, which
     the click/fill action space cannot reach.
